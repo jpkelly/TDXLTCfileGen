@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS / editors
+.DS_Store
+.vscode/
+
+# TouchDesigner: backups, numbered incremental saves, crash saves, logs
+Backup/
+*.[0-9].toe
+*.[0-9][0-9].toe
+*.[0-9][0-9][0-9].toe
+CrashAutoSave*.toe
+logs/
+
+# Not part of this project / not ours to redistribute
+LTC-Timecode-Generator-master/
+*.pdf
+.claude/

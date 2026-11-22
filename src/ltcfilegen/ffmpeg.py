@@ -24,7 +24,8 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from fractions import Fraction
 
 APP_DIR_NAME = "LTCfileGen"
 ENV_VAR = "LTCFILEGEN_FFMPEG"
@@ -71,15 +72,34 @@ def _imageio_binaries(folder: str) -> list[str]:
     return sorted((h for h in hits if not h.endswith((".py", ".md", ".txt"))), reverse=True)
 
 
-def candidates(override: str | None = None, env: dict | None = None) -> list[tuple[str, str]]:
-    """(source, path) pairs in the order they are tried. Paths may not exist."""
+#: Source menu: which kinds of ffmpeg discovery may use.
+SOURCES = ("auto", "downloaded", "system", "custom")
+
+#: Candidate source labels -> source-menu category.
+CATEGORY = {"setting": "custom", ENV_VAR: "custom",
+            "imageio-ffmpeg": "downloaded", "installed by this tool": "downloaded",
+            "installed by vCon": "shared", "pip user install": "shared",
+            "PATH": "system", "standard location": "system"}
+
+
+def candidates(override: str | None = None, env: dict | None = None,
+               source: str = "auto", share: bool = True) -> list[tuple[str, str]]:
+    """(source, path) pairs in the order they are tried. Paths may not exist.
+
+    ``source`` limits discovery to one category of the source menu:
+    ``downloaded`` (imageio-ffmpeg copies), ``system`` (PATH and standard
+    install folders such as Homebrew), ``custom`` (only ``override``) or
+    ``auto`` (all, in order). ``share=False`` ignores copies downloaded by
+    other tools (vCon, pip/pipx installs). The environment variable always
+    wins, for managed machines.
+    """
     env = os.environ if env is None else env
     home = os.path.expanduser("~")
     out: list[tuple[str, str]] = []
-    if override:
-        out.append(("setting", override))
     if env.get(ENV_VAR):
         out.append((ENV_VAR, env[ENV_VAR]))
+    if override and source in ("auto", "custom"):
+        out.append(("setting", override))
     try:
         import imageio_ffmpeg  # type: ignore
         out.append(("imageio-ffmpeg", imageio_ffmpeg.get_ffmpeg_exe()))
@@ -100,6 +120,15 @@ def candidates(override: str | None = None, env: dict | None = None) -> list[tup
         out.append(("PATH", which))
     for p in known_locations():
         out.append(("standard location", p))
+
+    def allowed(src: str) -> bool:
+        cat = CATEGORY[src]
+        if src == ENV_VAR:
+            return True
+        if cat == "shared":
+            return share and source in ("auto", "downloaded")
+        return source == "auto" or cat == source
+    out = [(s, p) for s, p in out if allowed(s)]
     seen, unique = set(), []
     for src, p in out:
         key = os.path.normcase(os.path.abspath(p))
@@ -167,13 +196,18 @@ def validate(path: str, source: str = "", timeout: float = 10.0) -> FfmpegInfo:
     return info
 
 
-def find_ffmpeg(override: str | None = None, env: dict | None = None) -> tuple[FfmpegInfo | None, list[FfmpegInfo]]:
+def find_ffmpeg(override: str | None = None, env: dict | None = None,
+                source: str = "auto", share: bool = True) -> tuple[FfmpegInfo | None, list[FfmpegInfo]]:
     """First usable ffmpeg, plus every candidate tried (for the setup dialog).
 
     An explicit setting that fails is reported, not silently replaced.
     """
+    if source not in SOURCES:
+        raise ValueError(f"source must be one of {SOURCES}")
     tried: list[FfmpegInfo] = []
-    for src, path in candidates(override, env):
+    if source == "custom" and not override and not (env or os.environ).get(ENV_VAR):
+        return None, [FfmpegInfo("", "setting", False, "", "no custom path set")]
+    for src, path in candidates(override, env, source, share):
         if not os.path.isfile(path):
             if src in ("setting", ENV_VAR):
                 tried.append(FfmpegInfo(path, src, False, "", "not found"))
@@ -189,7 +223,13 @@ def find_ffmpeg(override: str | None = None, env: dict | None = None) -> tuple[F
 
 
 def find_ffprobe(ffmpeg_path: str | None) -> str | None:
-    """ffprobe next to the chosen ffmpeg, else on PATH or a standard location."""
+    """ffprobe next to the chosen ffmpeg, else on PATH or a standard location.
+
+    Set LTCFILEGEN_NO_FFPROBE=1 to test the ffmpeg-only path most users have
+    (the pip-installed ffmpeg ships without ffprobe).
+    """
+    if os.environ.get("LTCFILEGEN_NO_FFPROBE"):
+        return None
     names = [_exe("ffprobe")]
     if ffmpeg_path:
         d = os.path.dirname(ffmpeg_path)
@@ -254,14 +294,97 @@ def start_install(python: str, log_path: str | None = None) -> subprocess.Popen:
 
 
 # ----------------------------------------------------------------------
+# Read back a finished file
+
+
+def probe_movie(ffmpeg: str, ffprobe: str | None, path: str, timeout: float = 60.0) -> dict:
+    """Rate, frame count, audio samples and timecode of a finished movie.
+
+    Uses ffprobe when available (exact counts from the container). With
+    ffmpeg only, reads the stream header: rate and duration, no counts.
+    Keys missing from the result could not be read.
+    """
+    import json
+    from fractions import Fraction
+    out: dict = {}
+    if ffprobe:
+        r = _run([ffprobe, "-v", "error", "-show_entries",
+                  "stream=codec_type,codec_tag_string,width,height,nb_frames,r_frame_rate,"
+                  "duration_ts,sample_rate,channels:stream_tags=timecode",
+                  "-of", "json", path], timeout)
+        info = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+        for s in info.get("streams", []):
+            if s.get("codec_type") == "video" and "rate" not in out:
+                out.update(rate=Fraction(s["r_frame_rate"]), frames=int(s.get("nb_frames", 0) or 0),
+                           width=int(s["width"]), height=int(s["height"]), codec=s.get("codec_tag_string", ""))
+                if s.get("tags", {}).get("timecode"):
+                    out["timecode"] = s["tags"]["timecode"]
+            elif s.get("codec_type") == "audio" and "samples" not in out:
+                out.update(samples=int(s.get("duration_ts", 0) or 0), sample_rate=int(s["sample_rate"]),
+                           channels=int(s["channels"]))
+        return out
+    import re
+    r = _run([ffmpeg, "-hide_banner", "-i", path], timeout)
+    text = r.stderr.decode("utf-8", "replace")
+    m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", text)
+    if m:
+        out["duration"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    m = re.search(r"Video: .*?, (\d+)x(\d+).*?, ([\d.]+) (?:fps|tbr)", text)
+    if m:
+        out.update(width=int(m.group(1)), height=int(m.group(2)), fps_text=m.group(3))
+    m = re.search(r"timecode\s*:\s*(\S+)", text)
+    if m:
+        out["timecode"] = m.group(1)
+    return out
+
+
+# ----------------------------------------------------------------------
 # Mux
 
 
+#: Common rates, to identify the exact rate from ffmpeg's rounded header text.
+KNOWN_RATES = tuple(Fraction(n, d) for n, d in (
+    (24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1), (48000, 1001), (48, 1),
+    (50, 1), (60000, 1001), (60, 1), (100, 1), (120000, 1001), (120, 1)))
+
+
+def video_rate(ffmpeg: str, ffprobe: str | None, path: str, timeout: float = 30.0) -> Fraction | None:
+    """Exact frame rate written in a movie's video stream (None if unreadable).
+
+    ffprobe gives the exact fraction. With ffmpeg only, the header's rounded
+    "59.94 fps" text is matched against KNOWN_RATES.
+    """
+    if ffprobe:
+        r = _run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+                  "stream=r_frame_rate", "-of", "csv=p=0", path], timeout)
+        text = r.stdout.decode("utf-8", "replace").strip().splitlines()
+        try:
+            return Fraction(text[0]) if text else None
+        except (ValueError, ZeroDivisionError):
+            return None
+    import re
+    r = _run([ffmpeg, "-hide_banner", "-i", path], timeout)
+    m = re.search(r"Video: .*?, ([\d.]+) fps", r.stderr.decode("utf-8", "replace"))
+    if not m:
+        return None
+    shown = float(m.group(1))
+    hits = [k for k in KNOWN_RATES if abs(float(k) - shown) < 0.006]
+    return hits[0] if len(hits) == 1 else None
+
+
 def mux_command(ffmpeg: str, video: str, pcm: dict, out: str,
-                timecode: str | None = None, progress_path: str | None = None) -> list[str]:
+                timecode: str | None = None, progress_path: str | None = None,
+                retime: Fraction | None = None) -> list[str]:
     """Copy the video untouched and add the raw PCM LTC track.
 
     ``pcm`` is the dict returned by ``LtcEncoder.write_pcm``.
+
+    ``retime`` rescales the video timestamps (still a stream copy) by
+    ``written_rate / wanted_rate``. TouchDesigner 2025.33230 writes 60 fps
+    files as 60000/1001; the frames are right, only the timestamps are
+    labelled at the wrong rate, so ``retime=Fraction(1000, 1001)`` fixes them.
+    pts, dts and durations are scaled separately so H.264/H.265 frame
+    reordering survives.
     """
     codec = {"s16le": "pcm_s16le", "s24le": "pcm_s24le"}[pcm["format"]]
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y",
@@ -271,6 +394,9 @@ def mux_command(ffmpeg: str, video: str, pcm: dict, out: str,
            "-map", "0:v:0", "-map", "1:a:0",
            "-c:v", "copy", "-c:a", codec,
            "-metadata:s:a:0", "title=LTC", "-metadata:s:a:0", "handler_name=LTC"]
+    if retime is not None and retime != 1:
+        a, b = retime.numerator, retime.denominator
+        cmd += ["-bsf:v", f"setts=pts=PTS*{a}/{b}:dts=DTS*{a}/{b}:duration=DURATION*{a}/{b}"]
     if timecode:
         cmd += ["-timecode", timecode]
     if progress_path:

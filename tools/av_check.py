@@ -13,7 +13,9 @@ engine (encoder + mux), then checks the FINISHED file:
   5. ltcdump (independent decoder) agrees, when installed.
 
 Usage: python tools/av_check.py manifest.json
-manifest: {name: {"spec": JobSpec kwargs, "video": path-to-video-only-mov}}
+manifest: {name: {"spec": JobSpec kwargs, "video": path-to-video-only-mov,
+                  "barcode_rows": [y_bits, y_inverted] (optional; default lab pattern),
+                  "muxed": true (optional: "video" is a finished file, skip the mux)}}
 """
 
 from __future__ import annotations
@@ -45,9 +47,14 @@ def probe(ffprobe, path, extra):
     return json.loads(run([ffprobe, "-v", "error", *extra, "-of", "json", path], text=True).stdout)
 
 
-def barcodes(ffmpeg, path, w, h):
+def barcodes(ffmpeg, path, w, h, ys=None):
+    """Decode the barcode from two pixel rows: (bits row, inverted-bits row).
+
+    Default: the lab's full-frame pattern. The component's debug strip sits at
+    the top, so pass ys=(strip_h // 4, 3 * strip_h // 4) for it.
+    """
     rows = []
-    for y in (h // 4, (3 * h) // 4):
+    for y in (ys or (h // 4, (3 * h) // 4)):
         raw = run([ffmpeg, "-v", "error", "-i", path, "-map", "0:v:0",
                    "-vf", f"format=gray,crop={w}:1:0:{y}", "-f", "rawvideo", "-"]).stdout
         rows.append([raw[i:i + w] for i in range(0, len(raw), w)])
@@ -68,12 +75,15 @@ def check_case(name, case, workdir, ffmpeg, ffprobe):
     plan = Plan(JobSpec(**case["spec"]))
     opts = AudioOptions()
     enc = LtcEncoder(plan, opts)
-    pcm = enc.write_pcm(os.path.join(workdir, f"{name}_ltc.pcm"))
-    out = os.path.join(workdir, f"{name}.mov")
-    r = subprocess.run(ff.mux_command(ffmpeg, case["video"], pcm, out, timecode=plan.embedded_timecode),
-                       capture_output=True, text=True)
-    if r.returncode:
-        return [f"mux failed: {r.stderr[-300:]}"], {}
+    if case.get("muxed"):
+        out = case["video"]
+    else:
+        pcm = enc.write_pcm(os.path.join(workdir, f"{name}_ltc.pcm"))
+        out = os.path.join(workdir, f"{name}.mov")
+        r = subprocess.run(ff.mux_command(ffmpeg, case["video"], pcm, out, timecode=plan.embedded_timecode),
+                           capture_output=True, text=True)
+        if r.returncode:
+            return [f"mux failed: {r.stderr[-300:]}"], {}
     fps = plan.rate.fps
     sr = opts.sample_rate
 
@@ -104,7 +114,7 @@ def check_case(name, case, workdir, ffmpeg, ffprobe):
     vstart = [p * tb * sr for p in pts]                              # exact, in samples
 
     # 3. barcodes
-    codes, badbits = barcodes(ffmpeg, out, int(vs["width"]), int(vs["height"]))
+    codes, badbits = barcodes(ffmpeg, out, int(vs["width"]), int(vs["height"]), case.get("barcode_rows"))
     if codes != list(range(plan.video_frames)):
         first = next((i for i, c in enumerate(codes) if c != i), len(codes))
         problems.append(f"barcode mismatch at frame {first} (got {codes[first:first + 3]})")

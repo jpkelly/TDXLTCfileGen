@@ -66,10 +66,12 @@ class Rate:
     def td_fps(self) -> float:
         """Value for the Movie File Out TOP's FPS parameter.
 
-        Measured (TD 2025.33407): 23.976 / 29.97 / 59.94 are written as the
-        exact 24000/1001, 30000/1001, 60000/1001. Passing the exact float
-        (e.g. 29.97002997) gives odd rationals like 979001/32666, so the
-        rounded menu value is the one to use.
+        Measured on TD 2025.33230 (release) and 2025.33407 (beta): 23.976 /
+        29.97 / 59.94 are written as the exact 24000/1001, 30000/1001,
+        60000/1001. Passing the exact float (e.g. 29.97002997) gives odd
+        rationals like 979001/32666, so the rounded menu value is the one to
+        use. TD 2025.33230 writes 60 as 60000/1001 in every codec; the mux
+        corrects that (ffmpeg.mux_command retime).
         """
         return float(self.key)
 

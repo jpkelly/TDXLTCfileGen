@@ -95,6 +95,8 @@ class LtcGenExt:
         self._ff_checked = False
         interrupted = self._recover_interrupted()
         self._set('Rendering', False)
+        self._set('Batchcount', len(self._rows()))
+        self._write_batch_view()
         self.Refresh()
         # Check ffmpeg a few frames after start-up (it runs ffmpeg up to three
         # times), so the help button is right on every machine, not only
@@ -452,7 +454,13 @@ class LtcGenExt:
         mvo.par.pause = 1
         self._status(f'Rendering {os.path.basename(final)}')
 
+    def _busy(self):
+        """A job is running, or a batch is between jobs."""
+        return bool(self.job) or getattr(self, '_batch_restore', None) is not None
+
     def Cancel(self):
+        for overrides in self.batch:
+            self._set_row_status(overrides, 'cancelled')
         self.batch = []
         if not self.job:
             self._restore_batch_settings()
@@ -466,12 +474,12 @@ class LtcGenExt:
         """Render each dict of parameter values in turn, e.g.
         [{'Duration': '01:00:00:00'}, {'Duration': '02:00:00:00', 'Start': '02:00:00:00'}].
         Results land in BatchResults as (overrides, status, file or None)."""
-        if self.job:
-            self._status('Already rendering')
+        if self._busy():
+            self._status('Busy: a render or batch is running')
             return
         self.batch = [dict(j) for j in jobs]
         self.BatchResults = []
-        keys = {k for j in self.batch for k in j}
+        keys = {k for j in self.batch for k in j if not k.startswith('_')}
         self._batch_restore = {k: getattr(self.pars, k).eval() for k in keys if hasattr(self.pars, k)}
         self.ownerComp.store('batch_restore', self._batch_restore)
         self._batch_total = len(self.batch)
@@ -482,13 +490,17 @@ class LtcGenExt:
             overrides = self.batch.pop(0)
             self._batch_current = overrides
             for k, v in overrides.items():
-                setattr(self.pars, k, v)
+                if not k.startswith('_'):
+                    setattr(self.pars, k, v)
+            self._set_row_status(overrides, 'rendering')
             self.Render()
             if self.job:
                 self.job['batch'] = overrides
                 return
+            self._set_row_status(overrides, self.pars.Status.eval())
             self.BatchResults.append((overrides, self.pars.Status.eval(), None))
         # Every remaining item failed validation: finish the batch here.
+        self._set('Rendering', False)
         self._restore_batch_settings()
         n_ok = sum(1 for r in self.BatchResults if r[2])
         self._status(f'Batch finished: {n_ok}/{len(self.BatchResults)} rendered.')
@@ -648,7 +660,6 @@ class LtcGenExt:
         """Stop everything and clean up. keep=True leaves the video and LTC files."""
         j, self.job = self.job, None
         self.ownerComp.unstore('active_job')
-        self._set('Rendering', False)
         if j and j.get('orig_cook'):
             project.cookRate = j['orig_cook']
         try:
@@ -678,6 +689,7 @@ class LtcGenExt:
         self._status(message)
         if j and 'batch' in j:
             ok = message.startswith('Done')
+            self._set_row_status(j['batch'], message)
             self.BatchResults.append((j['batch'], message, j['final'] if ok else None))
             if getattr(self, 'batch', None):
                 run("op(args[0]).ext.LtcGenExt._next_batch()", self.ownerComp.path,
@@ -686,6 +698,7 @@ class LtcGenExt:
             self._restore_batch_settings()
             n_ok = sum(1 for r in self.BatchResults if r[2])
             self._status(f'Batch finished: {n_ok}/{len(self.BatchResults)} rendered. Last: {message}')
+        self._set('Rendering', False)
         self.Refresh(update_status=False)
 
     def _restore_batch_settings(self):
@@ -721,6 +734,100 @@ class LtcGenExt:
             return (self.child('mvo').errors() or '').strip()
         except Exception:
             return ''
+
+    # ------------------------------------------------------------------
+    # Batch list (panel): rows are snapshots of the settings
+
+    #: Pages whose parameters make up a row (Setup stays global).
+    BATCH_PAGES = ('Job', 'Video', 'Picture', 'Audio')
+
+    def _rows(self):
+        return self.ownerComp.fetch('batch_rows', [], search=False)
+
+    def _store_rows(self, rows):
+        self.ownerComp.store('batch_rows', rows)
+        self._set('Batchcount', len(rows))
+        self._write_batch_view()
+
+    def _snapshot(self):
+        snap = {}
+        for page in self.ownerComp.customPages:
+            if page.name not in self.BATCH_PAGES:
+                continue
+            for par in page.pars:
+                if par.isPulse or par.readOnly:
+                    continue
+                snap[par.name] = par.eval()
+        return snap
+
+    def BatchAdd(self):
+        """Add the current settings as a batch row (only if they are valid)."""
+        if self._busy():
+            return
+        try:
+            plan, audio, cfg = self._settings()
+            name = self._filename(plan, cfg)
+        except (ValueError, self.tc.TimecodeError) as exc:
+            self._status(f'Cannot add to batch: {exc}')
+            return
+        rows = list(self._rows())
+        s = plan.summary()
+        rows.append({'settings': self._snapshot(), 'file': name + '.mov',
+                     'rate': plan.rate.key + (' DF' if plan.drop_frame else ''),
+                     'start': s['start'], 'duration': self.pars.Duration.eval(),
+                     'preroll': self.pars.Preroll.eval(), 'codec': CODECS[cfg['codec']][0],
+                     'size': f"{cfg['w']}x{cfg['h']}", 'status': 'queued'})
+        self._store_rows(rows)
+        self._status(f'Added to batch ({len(rows)} rows): {name}.mov')
+
+    def BatchRemove(self):
+        rows = list(self._rows())
+        if rows and not self._busy():
+            rows.pop()
+            self._store_rows(rows)
+
+    def BatchClear(self):
+        if not self._busy():
+            self._store_rows([])
+
+    def BatchRender(self):
+        rows = list(self._rows())
+        if not rows or self._busy():
+            return
+        for r in rows:
+            r['status'] = 'queued'
+        self._store_rows(rows)
+        self.RenderBatch([dict(r['settings'], _row=k) for k, r in enumerate(rows)])
+
+    def _set_row_status(self, overrides, text):
+        k = overrides.get('_row')
+        rows = list(self._rows())
+        if k is None or not 0 <= k < len(rows):
+            return
+        rows[k] = dict(rows[k], status=self._short_status(text))
+        self._store_rows(rows)
+
+    @staticmethod
+    def _short_status(text):
+        """Row status for the batch table; the full message stays in Status."""
+        t = ' '.join(str(text).split())
+        if t.startswith('Done'):
+            return 'done'
+        for prefix, short in (('Cannot render: ', 'invalid: '), ('Failed check: ', 'failed check: '),
+                              ('Failed: ', 'failed: ')):
+            if t.startswith(prefix):
+                return (short + t[len(prefix):])[:70]
+        return t[:70]
+
+    def _write_batch_view(self):
+        view = self.ownerComp.op('batch_view')
+        if view is None:
+            return
+        view.clear()
+        view.appendRow(['#', 'Status', 'Rate', 'Start', 'Duration', 'Pre-roll', 'Codec', 'Size', 'File'])
+        for k, r in enumerate(self._rows(), 1):
+            view.appendRow([k, r['status'], r['rate'], r['start'], r['duration'], r['preroll'],
+                            r['codec'], r['size'], r['file']])
 
     # ------------------------------------------------------------------
     # Setup & Help (the ? button)
@@ -772,7 +879,10 @@ class LtcGenExt:
             self._set(name, value)
         for key in ('active_job', 'batch_restore'):
             self.ownerComp.unstore(key)
+        rows = list(self._rows())
+        self._store_rows([])
         self.ownerComp.save(path)
+        self._store_rows(rows)
         self.Refresh()
         self.CheckFfmpeg(force=True)
         return path
@@ -783,7 +893,10 @@ class LtcGenExt:
     def OnPulse(self, par):
         n = par.name
         if n == 'Render':
-            self.Render()
+            if self._busy():
+                self._status('Busy: a render or batch is running')
+            else:
+                self.Render()
         elif n == 'Cancel':
             self.Cancel()
         elif n == 'Checkffmpeg':
@@ -792,9 +905,17 @@ class LtcGenExt:
             self.InstallFfmpeg()
         elif n == 'Help':
             self.ShowHelp()
+        elif n == 'Batchadd':
+            self.BatchAdd()
+        elif n == 'Batchremove':
+            self.BatchRemove()
+        elif n == 'Batchclear':
+            self.BatchClear()
+        elif n == 'Batchrender':
+            self.BatchRender()
 
     def OnParChange(self, par):
-        if par.name in ('Status', 'Progress', 'Summary', 'Ffmpegstatus', 'Ffmpegready', 'Rendering'):
+        if par.name in ('Status', 'Progress', 'Summary', 'Ffmpegstatus', 'Ffmpegready', 'Rendering', 'Batchcount'):
             return
         if par.name in ('Ffmpegsource', 'Ffmpegpath', 'Shareffmpeg'):
             self.CheckFfmpeg(force=True)

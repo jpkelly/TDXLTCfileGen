@@ -127,7 +127,7 @@ def test_probe_movie_reads_counts(tmp_path):
 @needs_ffmpeg
 @pytest.mark.parametrize("vcodec", ["prores_ks", "libx264"])
 def test_retime_fixes_60_written_as_5994(vcodec, tmp_path):
-    """TD 2025.33230 writes 60 fps as 60000/1001; the mux rescales timestamps."""
+    """A 60 fps file labelled 60000/1001 (TD in a 59.94 project); the mux rescales timestamps."""
     from fractions import Fraction
     p = Plan(JobSpec(rate="60", start="01:00:00:00", duration="00:00:02:00"))
     video = str(tmp_path / "v.mov")

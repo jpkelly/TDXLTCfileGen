@@ -70,8 +70,9 @@ class Rate:
         29.97 / 59.94 are written as the exact 24000/1001, 30000/1001,
         60000/1001. Passing the exact float (e.g. 29.97002997) gives odd
         rationals like 979001/32666, so the rounded menu value is the one to
-        use. TD 2025.33230 writes 60 as 60000/1001 in every codec; the mux
-        corrects that (ffmpeg.mux_command retime).
+        use. If the project runs at a 1001 rate, a whole-number movie FPS is
+        written at the project's rate instead, so the component renders in a
+        60 fps project (td/LtcGenExt.py RENDER_COOK_RATE).
         """
         return float(self.key)
 

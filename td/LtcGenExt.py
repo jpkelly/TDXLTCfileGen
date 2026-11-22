@@ -39,6 +39,14 @@ RESOLUTIONS = {'3840x2160': (3840, 2160), '2560x1440': (2560, 1440),
 EST_FRAMES_PER_SECOND = 60.0
 
 FINALIZE_TIMEOUT = 600          # s to wait for Movie File Out after record=0
+
+#: Project FPS while rendering. Measured on TD 2025.33230: when the project
+#: runs at a 1001 rate (23.976/29.97/59.94) and the movie FPS is a whole
+#: number (24/30/60), Movie File Out writes the PROJECT's rate instead, e.g.
+#: a 60 fps file at 60000/1001, or at 30000/1001 in a 29.97 project. In a
+#: 60 fps project every rate is written exactly. 60 is also the loop rate TD
+#: reaches here, so renders are no slower. The user's FPS is restored after.
+RENDER_COOK_RATE = 60.0
 RECORD_CHECK_FRAME = 5          # by then Movie File Out must have opened the file
 
 
@@ -105,6 +113,8 @@ class LtcGenExt:
         if mvo is not None:
             mvo.par.record = 0
             mvo.par.pause = 0
+        if stale.get('orig_cook'):
+            project.cookRate = stale['orig_cook']
         pid = stale.get('pid')
         if pid:
             try:
@@ -422,7 +432,10 @@ class LtcGenExt:
                     'video': video, 'final': final, 'stem': stem, 't0': time.time(),
                     'proc': None, 'log': None}
         self._set('Progress', 0.0)
-        self.ownerComp.store('active_job', {'video': video, 'pcm': pcm_path, 'stem': stem})
+        self.job['orig_cook'] = project.cookRate
+        self.ownerComp.store('active_job', {'video': video, 'pcm': pcm_path, 'stem': stem,
+                                            'orig_cook': project.cookRate})
+        project.cookRate = RENDER_COOK_RATE
         mvo.par.record = 1
         mvo.par.pause = 1
         self._status(f'Rendering {os.path.basename(final)}')
@@ -539,9 +552,9 @@ class LtcGenExt:
                'channels': audio.channels, 'format': audio.ffmpeg_format}
         j['mux_out'] = j['stem'] + '.muxing.mov'
         j['progress'] = j['stem'] + '.mux.progress'
-        # TouchDesigner 2025.33230 labels 60 fps files 60000/1001. The frames
-        # are right; rescale the timestamps during the (copy) mux. The
-        # read-back check after the mux still has the final say.
+        # Safety net: if Movie File Out still labelled the file 1000/1001 off
+        # (see RENDER_COOK_RATE), the frames are right; rescale the timestamps
+        # during the copy mux. The read-back check still has the final say.
         written = self.ff.video_rate(self.ffinfo.path, self.ffprobe, j['video'])
         retime = None
         if written is not None and written != plan.rate.fps:
@@ -558,7 +571,8 @@ class LtcGenExt:
         j['proc'] = subprocess.Popen(cmd, stdout=j['log'], stderr=j['log'],
                                      stdin=subprocess.DEVNULL, **kw)
         self.ownerComp.store('active_job', {'video': j['video'], 'pcm': j['pcm_path'],
-                                            'stem': j['stem'], 'pid': j['proc'].pid})
+                                            'stem': j['stem'], 'pid': j['proc'].pid,
+                                            'orig_cook': j.get('orig_cook')})
         j['state'], j['t_mux'] = 'mux', time.time()
         self._status('Adding LTC audio...')
 
@@ -622,6 +636,8 @@ class LtcGenExt:
         """Stop everything and clean up. keep=True leaves the video and LTC files."""
         j, self.job = self.job, None
         self.ownerComp.unstore('active_job')
+        if j and j.get('orig_cook'):
+            project.cookRate = j['orig_cook']
         try:
             self.child('mvo').par.record = 0
             self.child('mvo').par.pause = 0

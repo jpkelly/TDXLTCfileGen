@@ -380,11 +380,13 @@ def mux_command(ffmpeg: str, video: str, pcm: dict, out: str,
     ``pcm`` is the dict returned by ``LtcEncoder.write_pcm``.
 
     ``retime`` rescales the video timestamps (still a stream copy) by
-    ``written_rate / wanted_rate``. TouchDesigner 2025.33230 writes 60 fps
-    files as 60000/1001; the frames are right, only the timestamps are
-    labelled at the wrong rate, so ``retime=Fraction(1000, 1001)`` fixes them.
-    pts, dts and durations are scaled separately so H.264/H.265 frame
-    reordering survives.
+    ``written_rate / wanted_rate``. TouchDesigner's Movie File Out writes a
+    whole-number rate (e.g. 60) at the project's rate when the project runs
+    at a 1001 rate (e.g. 59.94); the frames are right, only the timestamps
+    are labelled wrong, so ``retime=Fraction(1000, 1001)`` fixes them. The
+    component avoids this by rendering in a 60 fps project; this is the
+    safety net. pts, dts and durations are scaled separately so H.264/H.265
+    frame reordering survives.
     """
     codec = {"s16le": "pcm_s16le", "s24le": "pcm_s24le"}[pcm["format"]]
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y",

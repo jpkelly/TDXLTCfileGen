@@ -94,7 +94,13 @@ class LtcGenExt:
         self.ffprobe = None
         self._ff_checked = False
         interrupted = self._recover_interrupted()
+        self._set('Rendering', False)
         self.Refresh()
+        # Check ffmpeg a few frames after start-up (it runs ffmpeg up to three
+        # times), so the help button is right on every machine, not only
+        # after the first render.
+        run('args[0].ext.LtcGenExt.CheckFfmpeg(force=True)', self.ownerComp,
+            delayFrames=15, fromOP=self.ownerComp)
         if interrupted:
             self._status('The last render was interrupted (the extension reloaded); '
                          'its temporary files are being removed. Render again.')
@@ -240,7 +246,7 @@ class LtcGenExt:
                              f"{int(secs // 3600)}:{int(secs % 3600 // 60):02d}:{secs % 60:05.2f}  |  "
                              f"render about {max(1, round(est / 60))} min")
         self.ApplySettings(cfg)
-        self.ApplyFrame(0, plan, cfg)
+        self.ApplyFrame(0, plan, cfg, preview=True)
         if update_status:
             self._status('Ready')
 
@@ -277,8 +283,9 @@ class LtcGenExt:
         g.par.vec3valuew = cfg['marker_h']
         g.par.vec4valuex = 0.7
 
-    def ApplyFrame(self, i, plan=None, cfg=None):
-        """Set everything that changes per frame for video frame i."""
+    def ApplyFrame(self, i, plan=None, cfg=None, preview=False):
+        """Set everything that changes per frame for video frame i.
+        preview=True never flashes, so the idle preview stays readable."""
         plan = plan or self.plan
         cfg = cfg or self.cfg
         if plan is None or cfg is None:
@@ -296,7 +303,7 @@ class LtcGenExt:
             if t.par.text.eval() != text:
                 t.par.text = text
         vlabel = plan.video_label(i)
-        flash = cfg['flash'] and vlabel[3] == 0
+        flash = cfg['flash'] and vlabel[3] == 0 and not preview
         bg, fg = (cfg['fg'], cfg['bg']) if flash else (cfg['bg'], cfg['fg'])
         g = self.child('glsl_picture')
         g.par.vec0valuex, g.par.vec0valuey, g.par.vec0valuez = bg
@@ -399,6 +406,10 @@ class LtcGenExt:
             final = stem + '.mov'
 
         ffinfo = self.CheckFfmpeg(force=True)
+        in_batch = getattr(self, '_batch_restore', None) is not None
+        if ffinfo is None and not self.install and in_batch:
+            self._status('Cannot render: ffmpeg not found (click ? for Setup & Help)')
+            return
         if ffinfo is None and not self.install:
             choice = ui.messageBox('LTC File Gen',
                                    'ffmpeg is needed to add the LTC audio and was not found.\n\n'
@@ -436,6 +447,7 @@ class LtcGenExt:
         self.ownerComp.store('active_job', {'video': video, 'pcm': pcm_path, 'stem': stem,
                                             'orig_cook': project.cookRate})
         project.cookRate = RENDER_COOK_RATE
+        self._set('Rendering', True)
         mvo.par.record = 1
         mvo.par.pause = 1
         self._status(f'Rendering {os.path.basename(final)}')
@@ -636,6 +648,7 @@ class LtcGenExt:
         """Stop everything and clean up. keep=True leaves the video and LTC files."""
         j, self.job = self.job, None
         self.ownerComp.unstore('active_job')
+        self._set('Rendering', False)
         if j and j.get('orig_cook'):
             project.cookRate = j['orig_cook']
         try:
@@ -710,6 +723,61 @@ class LtcGenExt:
             return ''
 
     # ------------------------------------------------------------------
+    # Setup & Help (the ? button)
+
+    def HelpText(self):
+        """The Setup & Help text (printable; ShowHelp puts it in a dialog)."""
+        info = self.CheckFfmpeg(force=True)
+        py = self.ff.python_for_pip() or ('py' if os.name == 'nt' else 'python3')
+        dest = self.ff.pylibs_dir()
+        cmd = ' '.join(f'"{a}"' if ' ' in a else a for a in self.ff.install_command(py, dest))
+        lines = ['AUDIO (ffmpeg): ' + ('READY' if info else 'NOT FOUND'), '']
+        if info:
+            lines += [f'ffmpeg {info.version}', f'  {info.path}', f'  found as: {info.source}',
+                      f'ffprobe: {self.ffprobe or "not found (optional)"}']
+        else:
+            lines += ['LTC audio is added to the rendered video with ffmpeg,',
+                      'which is not bundled. Install Now downloads it',
+                      '(imageio-ffmpeg, about 30 MB) into a folder in your',
+                      'user Library: no admin rights, nothing written into',
+                      'TouchDesigner, and it survives TouchDesigner updates.',
+                      '', 'Also found automatically: Homebrew / MacPorts /',
+                      'winget / Chocolatey / Scoop installs, and copies',
+                      'downloaded by vCon (Setup page: ffmpeg Source).']
+        lines += ['', 'Install folder:', f'  {dest}', '',
+                  'Manual install (Terminal, or cmd / PowerShell):', f'  {cmd}']
+        return '\n'.join(lines), cmd, info is not None
+
+    def ShowHelp(self):
+        text, cmd, ready = self.HelpText()
+        buttons = ['Check Again' if ready else 'Install Now', 'Copy Command', 'Close']
+        choice = ui.messageBox('LTC File Gen: Setup & Help', text, buttons=buttons)
+        if choice == 0:
+            if ready:
+                self.CheckFfmpeg(force=True)
+            else:
+                self.InstallFfmpeg()
+        elif choice == 1:
+            ui.clipboard = cmd
+            self._set('Ffmpegstatus', 'Install command copied to the clipboard')
+
+    def ExportTox(self, path=None):
+        """Save the component as a .tox without this machine's state in it."""
+        if self.job:
+            raise RuntimeError('cannot export while rendering')
+        path = path or os.path.join(_engine_root(self.ownerComp), 'td', 'LTCfileGen.tox')
+        self.child('mvo').par.file = ''
+        for name, value in (('Ffmpegready', False), ('Ffmpegstatus', ''), ('Status', ''),
+                            ('Summary', ''), ('Progress', 0.0), ('Rendering', False)):
+            self._set(name, value)
+        for key in ('active_job', 'batch_restore'):
+            self.ownerComp.unstore(key)
+        self.ownerComp.save(path)
+        self.Refresh()
+        self.CheckFfmpeg(force=True)
+        return path
+
+    # ------------------------------------------------------------------
     # Parameter callbacks (from the Parameter Execute DAT)
 
     def OnPulse(self, par):
@@ -722,9 +790,11 @@ class LtcGenExt:
             self.CheckFfmpeg(force=True)
         elif n == 'Installffmpeg':
             self.InstallFfmpeg()
+        elif n == 'Help':
+            self.ShowHelp()
 
     def OnParChange(self, par):
-        if par.name in ('Status', 'Progress', 'Summary', 'Ffmpegstatus', 'Ffmpegready'):
+        if par.name in ('Status', 'Progress', 'Summary', 'Ffmpegstatus', 'Ffmpegready', 'Rendering'):
             return
         if par.name in ('Ffmpegsource', 'Ffmpegpath', 'Shareffmpeg'):
             self.CheckFfmpeg(force=True)

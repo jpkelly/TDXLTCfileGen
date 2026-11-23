@@ -20,12 +20,14 @@ A TouchDesigner component that renders timecode movie files for media servers. E
 
 ## Getting started
 
-1. Clone or download this repository.
-2. In TouchDesigner, save a new project in the repository folder. The component loads its code from `td/` and `src/` next to the project.
-3. Drag `td/LTCfileGen.tox` into the project and open its panel.
-4. Set the rate, start, duration, codec and output folder, then click **Render**.
+Download from [Releases](https://github.com/jpkelly/TDXLTCfileGen/releases):
 
-For a batch, set up each file and click **Add current**, then **Render batch**.
+- **`LTCfileGen-<version>.toe`:** open it, and TouchDesigner shows the panel in its own window (Perform mode). Press Esc for the network, F1 to return.
+- **`LTCfileGen-<version>.tox`:** drag it into a network of your own project, then right-click it and choose **View** to open the panel.
+
+Set the rate, start, duration, codec and output folder, then click **Render**. For a batch, set up each file and click **Add current**, then **Render batch**.
+
+The component carries its own code. On first use it writes it to a versioned folder in the user data folder (`~/Library/Application Support/LTCfileGen/engine` on macOS, `%LOCALAPPDATA%\LTCfileGen\engine` on Windows).
 
 ## Engines
 
@@ -38,7 +40,7 @@ The **Engine** menu on the Video page picks how files are made:
 
 **Auto** (the default) uses ffmpeg fast when it can. Before every fast render, it checks that its frames match TouchDesigner's. NotchLC always uses TouchDesigner, because ffmpeg has no NotchLC encoder. If the fast engine fails, Auto renders in TouchDesigner instead.
 
-The TouchDesigner engine runs as fast as the display refreshes: about 120 frames/s on a 120 Hz screen.
+The TouchDesigner engine runs as fast as the display refreshes, for example about 120 frames/s on a 120 Hz screen. While it renders, the project runs at the fastest display's refresh rate, then returns to its own FPS. Anything else animating in the same project runs at that rate meanwhile, so render show content from the standalone `.toe`.
 
 ## Development
 
@@ -54,6 +56,15 @@ The timecode maths, LTC encoder, picture and ffmpeg code are plain Python in `sr
 
 Some tests need ffmpeg, or [ltc-tools](https://github.com/x42/ltc-tools) (`ltcgen`, `ltcdump`) as an independent decoder. They are skipped without them.
 
+To work on the component, save a TouchDesigner project in the repository folder, drag in `td/LTCfileGen.tox` and link its code to the repository files. In the textport:
+
+```python
+exec(open(project.folder + '/tools/td_release.py', encoding='utf-8').read())
+link_to_repo()
+```
+
+Edits to `td/` and `src/ltcfilegen/` then take effect in TouchDesigner.
+
 `tools/av_check.py` checks rendered files frame by frame. It reads a debug barcode from the picture (Picture page, **Debug Barcode Strip**) and compares it with the decoded LTC.
 
 | Path | Contents |
@@ -61,8 +72,14 @@ Some tests need ffmpeg, or [ltc-tools](https://github.com/x42/ltc-tools) (`ltcge
 | `src/ltcfilegen/` | timecode, job planning, LTC, picture, ffmpeg and fast-render worker |
 | `td/LtcGenExt.py` | the component's extension (render loop, panel, batch) |
 | `td/glsl/picture.glsl` | the picture shader |
-| `td/LTCfileGen.tox` | the component |
-| `tests/`, `tools/` | tests and the render checker |
+| `td/LTCfileGen.tox` | the component, self-contained |
+| `tests/` | tests |
+| `tools/` | render checker and release tools |
+
+### Releasing
+
+1. In the development project, run `release_tox()` (from `tools/td_release.py`, like `link_to_repo()` above). It writes `td/LTCfileGen.tox` with the code baked in and every setting at its default.
+2. Run `python3 tools/release_toe.py`. It puts the component in TouchDesigner's own empty project and writes `dist/LTCfileGen-<version>.toe`, which opens straight to the panel, plus a copy of the `.tox`.
 
 ## Status
 

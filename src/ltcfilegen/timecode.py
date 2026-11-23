@@ -72,7 +72,7 @@ class Rate:
         rationals like 979001/32666, so the rounded menu value is the one to
         use. If the project runs at a 1001 rate, a whole-number movie FPS is
         written at the project's rate instead, so the component renders in a
-        60 fps project (td/LtcGenExt.py RENDER_COOK_RATE).
+        whole-number-FPS project (td/LtcGenExt.py render_cook_rate).
         """
         return float(self.key)
 

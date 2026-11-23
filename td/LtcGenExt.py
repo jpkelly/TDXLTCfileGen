@@ -28,14 +28,18 @@ Render loop (one step per cooked frame, from the frame-start Execute DAT):
 """
 
 import dataclasses
+import hashlib
 import importlib
 import json
+import math
 import numpy as np
 import os
 from fractions import Fraction
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 # key: (label, videocodec, videocodectype, pixel format, size multiple)
@@ -52,10 +56,9 @@ CODECS = {
 RESOLUTIONS = {'3840x2160': (3840, 2160), '2560x1440': (2560, 1440),
                '1920x1080': (1920, 1080), '1280x720': (1280, 720)}
 
-#: Conservative render-speed estimate: one frame per TouchDesigner loop, and
-#: the loop follows the display refresh (measured about 118/s on a 120 Hz
-#: MacBook Pro display; presumably about 60/s on a 60 Hz display, untested).
-EST_FRAMES_PER_SECOND = 60.0
+#: TouchDesigner engine speed estimate, as a share of render_cook_rate():
+#: one frame per TouchDesigner loop (measured 117/s at 120 on a 120 Hz display).
+EST_LOOP_SHARE = 0.9
 
 #: Conservative ffmpeg fast-engine speeds at 1920x1080 (frames/s, every
 #: picture option on, M4 Max), scaled by pixel count for other sizes.
@@ -71,24 +74,103 @@ FINALIZE_TIMEOUT = 600          # s to wait for Movie File Out after record=0
 #: runs at a 1001 rate (23.976/29.97/59.94) and the movie FPS is a whole
 #: number (24/30/60), Movie File Out writes the PROJECT's rate instead, e.g.
 #: a 60 fps file at 60000/1001, or at 30000/1001 in a 29.97 project. In a
-#: whole-number project every rate is written exactly. 120 lets the loop run
-#: at a 120 Hz display's refresh: renders measured 117 frames/s at 120 and
-#: 60/s at 60, with every codec frame-exact (tools/av_check.py). The user's
-#: FPS is restored after.
-RENDER_COOK_RATE = 120.0
+#: whole-number project every rate is written exactly. The loop runs no
+#: faster than the display refreshes (asking for 240 or 1000 on a 120 Hz
+#: display still gave about 118/s), so render_cook_rate() asks for the
+#: fastest display's rate. Measured 117 frames/s at 120 and 60/s at 60, every
+#: codec frame-exact (tools/av_check.py). The user's FPS is restored after.
 RECORD_CHECK_FRAME = 5          # by then Movie File Out must have opened the file
 
 
-def _engine_root(ownerComp):
-    """Repo folder holding src/ltcfilegen (the extension file lives in td/)."""
+def render_cook_rate():
+    """Project FPS for a TouchDesigner-engine render: the fastest display's
+    refresh rate as a whole number (59.94 -> 60, 119.88 -> 120), at least 60."""
+    try:
+        fastest = max(m.refreshRate for m in monitors)
+    except Exception:                 # no monitor information
+        fastest = 120.0
+    return float(max(60, math.ceil(fastest - 0.05)))
+
+
+#: Engine modules the component carries in ./engine (the DAT 'init' holds
+#: __init__.py). Keep in step with src/ltcfilegen.
+ENGINE_MODULES = ('__init__', 'timecode', 'job', 'ltc', 'ffmpeg', 'picture', 'fastrender', 'decode')
+
+
+def _user_data_dir():
+    """Per-user data folder; same rule as ltcfilegen.ffmpeg.user_data_dir."""
+    home = os.path.expanduser('~')
+    if sys.platform == 'darwin':
+        return os.path.join(home, 'Library', 'Application Support', 'LTCfileGen')
+    if os.name == 'nt':
+        return os.path.join(os.environ.get('LOCALAPPDATA') or home, 'LTCfileGen')
+    return os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.join(home, '.local', 'share'),
+                        'LTCfileGen')
+
+
+def _repo_src(ownerComp):
+    """Development: the repo's src/ when the extension is synced from td/."""
     dat = ownerComp.op('LtcGenExt')
-    f = dat.par.file.eval() if dat is not None else ''
-    if f:
-        p = f if os.path.isabs(f) else os.path.join(project.folder, f)
-        root = os.path.dirname(os.path.dirname(os.path.abspath(p)))
-        if os.path.isdir(os.path.join(root, 'src', 'ltcfilegen')):
-            return root
-    return project.folder
+    if dat is None or not dat.par.syncfile.eval() or not dat.par.file.eval():
+        return None
+    f = dat.par.file.eval()
+    p = f if os.path.isabs(f) else os.path.join(project.folder, f)
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(p))), 'src')
+    return src if os.path.isfile(os.path.join(src, 'ltcfilegen', '__init__.py')) else None
+
+
+def _install_engine(ownerComp):
+    """Release: write the engine code the component carries to a versioned
+    folder (once per version) and return it. The fast worker runs in its own
+    Python process, so the package has to exist as files."""
+    eng = ownerComp.op('engine')
+    if eng is None:
+        raise RuntimeError(f'{ownerComp.path}/engine is missing')
+    files = {}
+    for name in ENGINE_MODULES:
+        dat = eng.op('init' if name == '__init__' else name)
+        if dat is None:
+            raise RuntimeError(f'{eng.path}/{name} is missing')
+        files[name + '.py'] = dat.text
+    digest = hashlib.sha1('\0'.join(k + '\0' + files[k] for k in sorted(files)).encode('utf-8'))
+    m = re.search(r'__version__\s*=\s*"([^"]+)"', files['__init__.py'])
+    tag = f"{m.group(1) if m else '0'}-{digest.hexdigest()[:12]}"
+    for base in (os.path.join(_user_data_dir(), 'engine'),
+                 os.path.join(tempfile.gettempdir(), 'LTCfileGen-engine')):
+        target = os.path.join(base, tag)
+        done = os.path.join(target, 'ltcfilegen', '.complete')
+        if os.path.isfile(done):
+            return target
+        tmp = f'{target}.tmp{os.getpid()}'
+        try:
+            pkg = os.path.join(tmp, 'ltcfilegen')
+            os.makedirs(pkg, exist_ok=True)
+            for fn, text in files.items():
+                with open(os.path.join(pkg, fn), 'w', encoding='utf-8', newline='\n') as fh:
+                    fh.write(text)
+            open(os.path.join(pkg, '.complete'), 'w').close()
+            try:
+                os.replace(tmp, target)
+            except OSError:              # another TouchDesigner wrote it first
+                shutil.rmtree(tmp, ignore_errors=True)
+            if os.path.isfile(done):
+                return target
+        except OSError:
+            shutil.rmtree(tmp, ignore_errors=True)
+    raise RuntimeError('cannot write the engine code to the user data or temp folder')
+
+
+def _load_engine(src):
+    """Import ltcfilegen fresh from src. Copies imported earlier (another
+    version, or before an edit on disk) are dropped from sys.modules; anything
+    still holding them keeps working."""
+    for name in [n for n in sys.modules if n == 'ltcfilegen' or n.startswith('ltcfilegen.')]:
+        del sys.modules[name]
+    while src in sys.path:
+        sys.path.remove(src)
+    sys.path.insert(0, src)
+    return [importlib.import_module('ltcfilegen.' + n)
+            for n in ('timecode', 'job', 'ltc', 'ffmpeg', 'picture')]
 
 
 def _label_for_file(text):
@@ -100,21 +182,9 @@ class LtcGenExt:
 
     def __init__(self, ownerComp):
         self.ownerComp = ownerComp
-        src = os.path.join(_engine_root(ownerComp), 'src')
-        if src not in sys.path:
-            sys.path.insert(0, src)
-        import ltcfilegen.timecode
-        import ltcfilegen.job
-        import ltcfilegen.ltc
-        import ltcfilegen.ffmpeg
-        import ltcfilegen.picture
-        # Reload in dependency order so edits on disk take effect on re-init.
-        for m in (ltcfilegen.timecode, ltcfilegen.job, ltcfilegen.ltc, ltcfilegen.ffmpeg,
-                  ltcfilegen.picture):
-            importlib.reload(m)
-        self.tc, self.jobs, self.ltc, self.ff = (ltcfilegen.timecode, ltcfilegen.job,
-                                                 ltcfilegen.ltc, ltcfilegen.ffmpeg)
-        self.pic = ltcfilegen.picture
+        # Development: the repo's src/. Release: the copy in ./engine.
+        self._src = _repo_src(ownerComp) or _install_engine(ownerComp)
+        self.tc, self.jobs, self.ltc, self.ff, self.pic = _load_engine(self._src)
         self._layouts = {}
         self._anchors = {}
         self.job = None
@@ -135,8 +205,8 @@ class LtcGenExt:
         # Check ffmpeg a few frames after start-up (it runs ffmpeg up to three
         # times), so the help button is right on every machine, not only
         # after the first render.
-        run('args[0].ext.LtcGenExt.CheckFfmpeg(force=True)', self.ownerComp,
-            delayFrames=15, fromOP=self.ownerComp)
+        run('o = op(args[0])\nif o is not None: o.ext.LtcGenExt.CheckFfmpeg(force=True)',
+            self.ownerComp.path, delayFrames=15, fromOP=self.ownerComp)
         if interrupted:
             self._status('The last render was interrupted (the extension reloaded); '
                          'its temporary files are being removed. Render again.')
@@ -282,7 +352,7 @@ class LtcGenExt:
             est = plan.video_frames / (FAST_EST_FPS[cfg['codec']] * 1920 * 1080 / (cfg['w'] * cfg['h']))
         else:
             how = 'TouchDesigner'
-            est = plan.video_frames / EST_FRAMES_PER_SECOND
+            est = plan.video_frames / (EST_LOOP_SHARE * render_cook_rate())
         when = 'under a minute' if est < 60 else f'about {round(est / 60)} min'
         s = plan.summary()
         self._set('Summary', f"{s['first']} to {s['end']}  |  {plan.video_frames:,} frames  |  "
@@ -619,7 +689,7 @@ class LtcGenExt:
                'timecode': plan.embedded_timecode if cfg['tctrack'] else None}
         with open(paths['job'], 'w') as fh:
             json.dump(job, fh)
-        src = os.path.join(_engine_root(self.ownerComp), 'src')
+        src = self._src
         env = dict(os.environ)
         env['PYTHONPATH'] = src + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
         kw = {'creationflags': 0x08000000} if os.name == 'nt' else {}
@@ -679,7 +749,7 @@ class LtcGenExt:
         self._set('Progress', 0.0)
         self.job['orig_cook'] = project.cookRate
         self._store_active(self.job)
-        project.cookRate = RENDER_COOK_RATE
+        project.cookRate = render_cook_rate()
         self._set('Rendering', True)
         mvo.par.record = 1
         mvo.par.pause = 1
@@ -896,7 +966,7 @@ class LtcGenExt:
         j['mux_out'] = j['stem'] + '.muxing.mov'
         j['progress'] = j['stem'] + '.mux.progress'
         # Safety net: if Movie File Out still labelled the file 1000/1001 off
-        # (see RENDER_COOK_RATE), the frames are right; rescale the timestamps
+        # (see render_cook_rate), the frames are right; rescale the timestamps
         # during the copy mux. The read-back check still has the final say.
         written = self.ff.video_rate(self.ffinfo.path, self.ffprobe, j['video'])
         retime = None
@@ -1192,25 +1262,6 @@ class LtcGenExt:
         elif choice == 1:
             ui.clipboard = cmd
             self._set('Ffmpegstatus', 'Install command copied to the clipboard')
-
-    def ExportTox(self, path=None):
-        """Save the component as a .tox without this machine's state in it."""
-        if self.job:
-            raise RuntimeError('cannot export while rendering')
-        path = path or os.path.join(_engine_root(self.ownerComp), 'td', 'LTCfileGen.tox')
-        self.child('mvo').par.file = ''
-        for name, value in (('Ffmpegready', False), ('Ffmpegstatus', ''), ('Status', ''),
-                            ('Summary', ''), ('Progress', 0.0), ('Rendering', False)):
-            self._set(name, value)
-        for key in ('active_job', 'batch_restore'):
-            self.ownerComp.unstore(key)
-        rows = list(self._rows())
-        self._store_rows([])
-        self.ownerComp.save(path)
-        self._store_rows(rows)
-        self.Refresh()
-        self.CheckFfmpeg(force=True)
-        return path
 
     # ------------------------------------------------------------------
     # Parameter callbacks (from the Parameter Execute DAT)

@@ -178,7 +178,7 @@ def _label_for_file(text):
 
 
 class LtcGenExt:
-    """Promoted: Render, Cancel, Refresh, ApplyFrame, CheckFfmpeg, InstallFfmpeg."""
+    """Promoted: Render, Cancel, Refresh, ApplyFrame, CheckFfmpeg, InstallFfmpeg, ShowSettings."""
 
     def __init__(self, ownerComp):
         self.ownerComp = ownerComp
@@ -342,6 +342,8 @@ class LtcGenExt:
         except (ValueError, self.tc.TimecodeError) as exc:
             self.plan = None
             self._set('Summary', '')
+            self._set('Estimate', '')
+            self._set('Outputfile', '')
             self._status(f'Check settings: {exc}')
             return
         self.plan, self.audio, self.cfg = plan, audio, cfg
@@ -353,11 +355,21 @@ class LtcGenExt:
         else:
             how = 'TouchDesigner'
             est = plan.video_frames / (EST_LOOP_SHARE * render_cook_rate())
-        when = 'under a minute' if est < 60 else f'about {round(est / 60)} min'
+        when = 'renders in under a minute' if est < 60 else f'renders in about {round(est / 60)} min'
         s = plan.summary()
-        self._set('Summary', f"{s['first']} to {s['end']}  |  {plan.video_frames:,} frames  |  "
-                             f"{int(secs // 3600)}:{int(secs % 3600 // 60):02d}:{secs % 60:05.2f}  |  "
-                             f"render {when} ({how})")
+        self._set('Summary', f"{s['first']} to {s['end']}   \u00b7   {plan.video_frames:,} frames   \u00b7   "
+                             f"{int(secs // 3600)}:{int(secs % 3600 // 60):02d}:{secs % 60:05.2f}")
+        self._set('Estimate', f'{when} ({how})')
+        try:
+            name = self._filename(plan, cfg) + '.mov'
+        except ValueError as exc:
+            name = f'(file name: {exc})'
+        folder = self.pars.Outputfolder.eval()
+        where = os.path.abspath(os.path.join(project.folder, folder)) if folder else ''
+        home = os.path.expanduser('~')
+        if where == home or where.startswith(home + os.sep):
+            where = '~' + where[len(home):]
+        self._set('Outputfile', f'{name}   in   {where}' if where else f'{name}   (choose an output folder)')
         self.ApplySettings(cfg)
         self.ApplyFrame(0, plan, cfg, preview=True)
         if update_status:
@@ -600,6 +612,9 @@ class LtcGenExt:
             self._status(f'Cannot render: {exc}')
             return
         folder = self.pars.Outputfolder.eval()
+        # TouchDesigner stores a folder inside the project folder relative to
+        # it; the fast worker and ffmpeg run elsewhere, so make it absolute.
+        folder = os.path.abspath(os.path.join(project.folder, folder)) if folder else ''
         if not folder or not os.path.isdir(folder):
             self._status('Cannot render: choose an existing output folder')
             return
@@ -1249,6 +1264,12 @@ class LtcGenExt:
         lines += ['', 'Install folder:', f'  {dest}', '',
                   'Manual install (Terminal, or cmd / PowerShell):', f'  {cmd}']
         return '\n'.join(lines), cmd, info is not None
+
+    def ShowSettings(self):
+        """Open the More settings window (Picture, Audio and Setup pages)."""
+        win = self.ownerComp.op('settings/win')
+        if win is not None:
+            win.par.winopen.pulse()
 
     def ShowHelp(self):
         text, cmd, ready = self.HelpText()

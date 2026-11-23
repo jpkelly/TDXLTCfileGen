@@ -25,13 +25,13 @@ Download from [Releases](https://github.com/jpkelly/TDXLTCfileGen/releases):
 - **`LTCfileGen-<version>.toe`:** open it, and TouchDesigner shows the panel in its own window (Perform mode). Press Esc for the network, F1 to return.
 - **`LTCfileGen-<version>.tox`:** drag it into a network of your own project, then right-click it and choose **View** to open the panel.
 
-Set the rate, start, duration, codec and output folder, then click **Render**. For a batch, set up each file and click **Add current**, then **Render batch**.
+Set the rate, start, duration, codec and output folder, then click **Render**. The line under the preview shows the file it will write. For a batch, set up each file and click **Add current**, then **Render batch**. **More settings…** opens the picture options (readouts, countdown, colours), the LTC audio settings and the ffmpeg setup.
 
 The component carries its own code. On first use it writes it to a versioned folder in the user data folder (`~/Library/Application Support/LTCfileGen/engine` on macOS, `%LOCALAPPDATA%\LTCfileGen\engine` on Windows).
 
 ## Engines
 
-The **Engine** menu on the Video page picks how files are made:
+The **Engine** menu picks how files are made:
 
 | Engine | How | 1 h of 59.94 fps HAP (Apple M4 Max) |
 |---|---|---|
@@ -63,9 +63,9 @@ exec(open(project.folder + '/tools/td_release.py', encoding='utf-8').read())
 link_to_repo()
 ```
 
-Edits to `td/` and `src/ltcfilegen/` then take effect in TouchDesigner.
+Edits to `td/` and `src/ltcfilegen/` then take effect in TouchDesigner. The panel is built by `tools/td_build_ui.py` (`build_ui()`, run the same way) from TouchDesigner's Basic Widgets, each bound to one of the component's parameters.
 
-`tools/av_check.py` checks rendered files frame by frame. It reads a debug barcode from the picture (Picture page, **Debug Barcode Strip**) and compares it with the decoded LTC.
+`tools/av_check.py` checks rendered files frame by frame. It reads a debug barcode from the picture (**More settings… → Picture → Debug Barcode Strip**) and compares it with the decoded LTC.
 
 | Path | Contents |
 |---|---|
@@ -74,7 +74,7 @@ Edits to `td/` and `src/ltcfilegen/` then take effect in TouchDesigner.
 | `td/glsl/picture.glsl` | the picture shader |
 | `td/LTCfileGen.tox` | the component, self-contained |
 | `tests/` | tests |
-| `tools/` | render checker and release tools |
+| `tools/` | render checker, panel builder and release tools |
 
 ### Releasing
 

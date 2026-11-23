@@ -37,6 +37,11 @@ TEMPLATES = ("/Applications/TouchDesigner.app/Contents/Resources/tfs/Samples/Set
 #: Must not appear anywhere in the shipped files (plus this machine's name).
 #: The code itself names "Application Support" / LOCALAPPDATA, so those can't be on the list.
 PRIVATE = [b"/Users/", b"\\Users\\", b"/home/", b"scratchpad", b"private/tmp", b"tdmcp", b"TDMCP"]
+#: Known text from TouchDesigner itself, not from any user's machine: the
+#: dropdown widget's pop-up menu is a live clone of /sys/TDTox/popMenu, whose
+#: style template keeps a Derivative developer's path. Every TouchDesigner
+#: install ships it, and the clone restores it on every copy.
+ALLOWED = [b"C:/Users/sunsp/Desktop/Derivative/TDSystemII/DevIvan/~TdDevelopment.json"]
 
 
 def find_tool(name: str) -> str:
@@ -73,8 +78,15 @@ def entries(d: Path) -> list[str]:
 
 def private_hits(d: Path) -> list[str]:
     words = PRIVATE + [socket.gethostname().split(".")[0].encode()]
-    return sorted({f.relative_to(d).as_posix() for f in d.rglob("*")
-                   if f.is_file() and any(w in f.read_bytes() for w in words)})
+    hits = set()
+    for f in d.rglob("*"):
+        if f.is_file():
+            data = f.read_bytes()
+            for allowed in ALLOWED:
+                data = data.replace(allowed, b"")
+            if any(w in data for w in words):
+                hits.add(f.relative_to(d).as_posix())
+    return sorted(hits)
 
 
 def version() -> str:

@@ -82,7 +82,7 @@ def run(job: dict) -> int:
     comp = picture.Compositor(cfg, layers, info)
     encoder = ff.FastEncoder(job["encoder"]["name"], tuple(job["encoder"]["args"]),
                              job["encoder"]["pix_fmt"], bool(job["encoder"]["yuv"]))
-    cmd = ff.encode_command(job["ffmpeg"], encoder, cfg["w"], cfg["h"], comp.gray,
+    cmd = ff.encode_command(job["ffmpeg"], encoder, cfg["w"], cfg["h"], comp.pix_fmt,
                             Fraction(plan.rate.num, plan.rate.den), pcm, job["out"],
                             timecode=job.get("timecode"))
     kw = {"creationflags": 0x08000000} if os.name == "nt" else {}

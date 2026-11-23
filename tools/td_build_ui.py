@@ -459,6 +459,7 @@ def _layout(comp, body, form_h):
     preview.par.alignorder = 0
     preview.par.vmode = 'fixed'
     preview.par.h.expr = 'int(me.width * 9 / 16)'
+    _build_preview(right, preview)
     _text(right, 'ui_summary', 1, 20, SIZE_TEXT, TEXT_DIM, text_expr='parent.LtcGen.par.Summary.eval()')
     _text(right, 'ui_output', 2, 20, SIZE_TEXT, TEXT_DIM, text_expr='parent.LtcGen.par.Outputfile.eval()')
     spacer = right.op('ui_spacer') or _container(right, 'ui_spacer', 10, 10)
@@ -502,6 +503,65 @@ def _ensure_readonly(comp, name, after):
         page.sort(*names)
 
 
+#: Codec menu (Video page). Keys match CODECS in td/LtcGenExt.py.
+CODEC_MENU = [('hap', 'HAP'), ('hapalpha', 'HAP Alpha'), ('hapq', 'HAP Q'), ('notchlc', 'NotchLC'),
+              ('prores422hq', 'ProRes 422 HQ'), ('prores422', 'ProRes 422'), ('prores4444', 'ProRes 4444'),
+              ('h264', 'H.264'), ('h265', 'H.265')]
+
+
+def _ensure_codec_menu(comp):
+    par = comp.par.Codec
+    par.menuNames = [k for k, _ in CODEC_MENU]
+    par.menuLabels = [label for _, label in CODEC_MENU]
+    par.default = 'hap'
+
+
+#: Preview only: checks behind the picture, so a clear background shows.
+CHECKER_GLSL = '''// LTC File Generator preview: a checkerboard (display only, never recorded).
+out vec4 fragColor;
+
+void main()
+{
+    vec2 res = uTDOutputInfo.res.zw;
+    vec2 cell = floor(vUV.st * res / max(8.0, floor(res.y / 27.0)));
+    float c = mod(cell.x + cell.y, 2.0) < 1.0 ? 0.12 : 0.2;
+    fragColor = TDOutputSwizzle(vec4(vec3(c), 1.0));
+}
+'''
+
+
+def _build_preview(right, preview):
+    """The panel shows null_out over a checkerboard. null_out, which is
+    recorded and checked, is untouched; opaque pictures cover the checks."""
+    src = right.op('preview_picture') or right.create(selectTOP, 'preview_picture')
+    src.par.top.expr = "parent.LtcGen.op('null_out')"
+    chk = right.op('preview_checks')
+    if chk is None:
+        chk = right.create(glslTOP, 'preview_checks')
+        for suffix in ('_compute', '_info'):
+            extra = right.op('preview_checks' + suffix)
+            if extra is not None:
+                extra.destroy()
+    pix = right.op('preview_checks_pixel')
+    pix.text = CHECKER_GLSL
+    chk.par.pixeldat = pix.name
+    chk.par.outputresolution = 'custom'
+    chk.par.resolutionw.expr = "op('preview_picture').width"
+    chk.par.resolutionh.expr = "op('preview_picture').height"
+    over = right.op('preview_over') or right.create(compositeTOP, 'preview_over')
+    over.inputConnectors[0].connect(src)
+    over.inputConnectors[1].connect(chk)
+    over.par.operand = 'over'
+    out = right.op('null_preview') or right.create(nullTOP, 'null_preview')
+    out.inputConnectors[0].connect(over)
+    preview.par.opviewer.expr = "op('null_preview')"
+    # beside the panel parts in ui_right's network
+    xs = [o.nodeX + o.nodeWidth for o in right.children if o.isPanel]
+    x0 = (max(xs) if xs else 0) + 200
+    for o, x, y in ((src, x0, 0), (chk, x0, -150), (pix, x0, -300), (over, x0 + 175, 0), (out, x0 + 350, 0)):
+        o.nodeX, o.nodeY = x, y
+
+
 def _ensure_output_menu(comp):
     """Output: Movie, Movie + WAV or WAV only (Job page, after Overwrite)."""
     if not hasattr(comp.par, 'Output'):
@@ -525,6 +585,7 @@ def build_ui(comp_path='/project1/LTCfileGen'):
     _ensure_readonly(comp, 'Outputfile', 'Estimate')    # the file a render writes
     _ensure_readonly(comp, 'Lastfile', 'Outputfile')    # last finished file (Show in Finder)
     _ensure_output_menu(comp)
+    _ensure_codec_menu(comp)
     body = comp.op('ui_body')
     _build_settings(comp, body)
     form, bound, form_h = _build_form(comp, body)

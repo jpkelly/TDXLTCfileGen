@@ -30,7 +30,7 @@ PCM = {"path": "ltc.pcm", "sample_rate": 48000, "channels": 2, "format": "s24le"
 
 def test_encode_command_reads_frames_from_stdin_and_tags_bt709():
     enc = ff.FAST_ENCODERS["prores422hq"][1]
-    cmd = ff.encode_command("ffmpeg", enc, 1920, 1080, True, Fraction(30000, 1001), PCM, "out.mov",
+    cmd = ff.encode_command("ffmpeg", enc, 1920, 1080, "gray", Fraction(30000, 1001), PCM, "out.mov",
                             timecode="01:00:00;00")
     s = " ".join(cmd)
     assert "-f rawvideo -pix_fmt gray -color_range pc -s 1920x1080 -framerate 30000/1001 -i pipe:0" in s
@@ -46,28 +46,46 @@ def test_encode_command_reads_frames_from_stdin_and_tags_bt709():
 
 def test_hap_keeps_rgb_and_is_not_range_converted():
     enc = ff.FAST_ENCODERS["hap"][0]
-    cmd = ff.encode_command("ffmpeg", enc, 64, 64, False, Fraction(25), PCM, "o.mov")
+    cmd = ff.encode_command("ffmpeg", enc, 64, 64, "rgb24", Fraction(25), PCM, "o.mov")
     vf = cmd[cmd.index("-vf") + 1]
     assert vf.startswith("format=rgba,") and "out_range" not in vf
     assert "-pix_fmt rgb24" in " ".join(cmd) and "-chunks 12" in " ".join(cmd)
 
 
+def test_alpha_frames_keep_their_alpha_into_yuv():
+    enc = ff.FAST_ENCODERS["prores4444"][1]
+    cmd = ff.encode_command("ffmpeg", enc, 64, 64, "ya8", Fraction(25), PCM, "o.mov")
+    assert "-pix_fmt ya8" in " ".join(cmd)
+    assert cmd[cmd.index("-pix_fmt", cmd.index("-c:v")) + 1] == "yuva444p10le"
+    with pytest.raises(ValueError):
+        ff.encode_command("ffmpeg", enc, 64, 64, "bgra", Fraction(25), PCM, "o.mov")
+
+
+def test_mux_relabels_prores_as_bt709_in_frames_and_container():
+    cmd = ff.mux_command("ffmpeg", "v.mov", PCM, "o.mov", retime=Fraction(1001, 1000), bt709=True)
+    bsf = cmd[cmd.index("-bsf:v") + 1]
+    assert bsf.startswith("setts=") and bsf.endswith(",prores_metadata=colorspace=bt709")
+    assert cmd[cmd.index("-colorspace") + 1] == "bt709"
+    assert "-bsf:v" not in ff.mux_command("ffmpeg", "v.mov", PCM, "o.mov")
+
+
 def test_every_fast_codec_has_an_encoder_listed():
-    assert set(ff.FAST_ENCODERS) == {"hap", "hapq", "prores422hq", "prores422", "h264", "h265"}
+    assert set(ff.FAST_ENCODERS) == {"hap", "hapalpha", "hapq", "prores422hq", "prores422", "prores4444",
+                                     "h264", "h265"}
     for encs in ff.FAST_ENCODERS.values():
         assert encs and all(isinstance(e, ff.FastEncoder) for e in encs)
 
 
-def _job(tmp_path, codec, rate="59.94", df=True, colour=False):
+def _job(tmp_path, codec, rate="59.94", df=True, colour=False, alpha=False):
     plan, cfg, layers, info, _ = _setup(rate=rate, df=df, start="00:59:58;00" if df else "00:59:58:00",
-                                        colour=colour)
+                                        colour=colour, alpha=alpha)
     glyphs = str(tmp_path / "g.npz")
     pic.save_layers(glyphs, layers, info)
     enc = ff.fast_encoder(FOUND.path, codec)
     if enc is None:
         pytest.skip(f"this ffmpeg cannot encode {codec}")
     keys = ("w", "h", "fg", "bg", "main", "secondary", "countdown", "flash", "marker", "marker_h",
-            "barcode", "strip_h")
+            "barcode", "strip_h", "alpha")
     job = {"spec": dataclasses.asdict(plan.spec), "audio": dataclasses.asdict(AudioOptions()),
            "cfg": {k: cfg[k] for k in keys}, "glyphs": glyphs, "pcm": str(tmp_path / "a.pcm"),
            "out": str(tmp_path / "out.mov"), "status": str(tmp_path / "st.json"),
@@ -78,10 +96,10 @@ def _job(tmp_path, codec, rate="59.94", df=True, colour=False):
     return plan, cfg, layers, info, job, str(path)
 
 
-def _decode(path, w=W, h=H):
+def _decode(path, w=W, h=H, fmt="rgb24"):
     raw = subprocess.run([FOUND.path, "-v", "error", "-i", path, "-map", "0:v:0", "-f", "rawvideo",
-                          "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
-    return np.frombuffer(raw, np.uint8).reshape(-1, h, w, 3)
+                          "-pix_fmt", fmt, "-"], capture_output=True, check=True).stdout
+    return np.frombuffer(raw, np.uint8).reshape(-1, h, w, 4 if fmt == "rgba" else 3)
 
 
 @needs_ffmpeg
@@ -115,3 +133,27 @@ def test_worker_reports_a_failing_encoder(tmp_path):
     assert fastrender.main([path]) == 1
     st = json.loads(open(job["status"]).read())
     assert st["phase"] == "failed" and "ffmpeg" in st["error"]
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize("codec", ["hapalpha", "prores4444"])
+@pytest.mark.parametrize("colour", [False, True])
+def test_worker_makes_movies_with_a_clear_background(tmp_path, codec, colour):
+    plan, cfg, layers, info, job, path = _job(tmp_path, codec, colour=colour, alpha=True)
+    env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"))
+    rc = subprocess.run([sys.executable, "-m", "ltcfilegen.fastrender", path], env=env).returncode
+    assert rc == 0, open(job["status"]).read()
+    frames = _decode(job["out"], fmt="rgba")
+    assert len(frames) == plan.video_frames
+    for i in range(plan.video_frames):
+        texts, flash, slot = pic.frame_state(plan, cfg, i)
+        a = frames[i, cfg["strip_h"]:, :, 3]                   # below the (opaque) barcode
+        if flash:
+            assert a.min() >= 254, i
+        else:
+            assert a.min() == 0 and a.max() >= 254, i
+        bars = frames[i, 4, (np.arange(24) * W // 24 + W // 48), :3].mean(axis=1) > 128
+        assert sum(int(b) << k for k, b in enumerate(bars)) == i
+    clear = next(i for i in range(plan.video_frames) if not pic.frame_state(plan, cfg, i)[1])
+    assert ff.alpha_range(FOUND.path, job["out"], clear, W, H)[0] == 0
+    assert ff.alpha_range(FOUND.path, job["out"], clear, W, H)[1] >= 254

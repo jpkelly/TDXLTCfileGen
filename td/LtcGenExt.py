@@ -46,14 +46,23 @@ import wave
 
 # key: (label, videocodec, videocodectype, pixel format, size multiple)
 CODECS = {
-    'hap':         ('HAP',           'hap',     'hap',         'rgb',         4),
-    'hapq':        ('HAP Q',         'hap',     'hapq',        'rgb',         4),
-    'notchlc':     ('NotchLC',       'notchlc', None,          'rgb',         4),
-    'prores422hq': ('ProRes 422 HQ', 'prores',  'prores422hq', 'yuv42210bit', 2),
-    'prores422':   ('ProRes 422',    'prores',  'prores422',   'yuv42210bit', 2),
+    'hap':         ('HAP',           'hap',     'hap',         'rgb',           4),
+    'hapalpha':    ('HAP Alpha',     'hap',     'hap',         'rgba',          4),
+    'hapq':        ('HAP Q',         'hap',     'hapq',        'rgb',           4),
+    'notchlc':     ('NotchLC',       'notchlc', None,          'rgb',           4),
+    'prores422hq': ('ProRes 422 HQ', 'prores',  'prores422hq', 'yuv42210bit',   2),
+    'prores422':   ('ProRes 422',    'prores',  'prores422',   'yuv42210bit',   2),
+    'prores4444':  ('ProRes 4444',   'prores',  'prores4444',  'yuva444412bit', 2),
     'h264':        ('H.264',         'h264',    None,          'yuv420',      2),
     'h265':        ('H.265',         'h265',    None,          'yuv420',      2),
 }
+
+#: Codecs with a clear background (alpha channel), for overlays.
+ALPHA_CODECS = ('hapalpha', 'prores4444')
+
+#: Codecs Movie File Out writes only with a Commercial or Pro licence
+#: (TouchDesigner engine only: ffmpeg fast encodes them with any licence).
+TD_LICENSED_CODECS = ('h264', 'h265')
 
 RESOLUTIONS = {'3840x2160': (3840, 2160), '2560x1440': (2560, 1440),
                '1920x1080': (1920, 1080), '1280x720': (1280, 720)}
@@ -64,8 +73,8 @@ EST_LOOP_SHARE = 0.9
 
 #: Conservative ffmpeg fast-engine speeds at 1920x1080 (frames/s, every
 #: picture option on, M4 Max), scaled by pixel count for other sizes.
-FAST_EST_FPS = {'hap': 500, 'hapq': 400, 'prores422hq': 400, 'prores422': 400,
-                'h264': 400, 'h265': 150}
+FAST_EST_FPS = {'hap': 500, 'hapalpha': 400, 'hapq': 400, 'prores422hq': 400, 'prores422': 400,
+                'prores4444': 150, 'h264': 400, 'h265': 150}
 
 #: WAV only: seconds of LTC written per second (1 h in about 10 s on an M4 Max).
 WAV_SPEED = 300
@@ -322,7 +331,7 @@ class LtcGenExt:
         audio.validate()
 
         cfg = {
-            'w': w, 'h': h, 'codec': codec,
+            'w': w, 'h': h, 'codec': codec, 'alpha': codec in ALPHA_CODECS,
             'main': p.Mainreadout.eval(), 'secondary': bool(p.Secondary.eval()),
             'countdown': bool(p.Countdown.eval()), 'flash': bool(p.Syncflash.eval()),
             'marker': bool(p.Framemarker.eval()), 'info': bool(p.Infocaption.eval()),
@@ -460,6 +469,7 @@ class LtcGenExt:
         g.par.vec2valuey = i
         g.par.vec3valuey = slot
         g.par.vec3valuez = plan.rate.nominal
+        g.par.vec5valuex = 1.0 if cfg.get('alpha') and not flash else 0.0
 
     def _line_layout(self, line, tmpl):
         """Fixed character positions for a line, from its Text TOP's font."""
@@ -510,11 +520,12 @@ class LtcGenExt:
         return np.ascontiguousarray(np.flipud(np.floor(a[:, :, 3] * 255 + 0.5)).astype(np.uint8))
 
     def _picture(self, cfg):
-        """The finished picture (null_out) as uint8 RGB, top row first."""
+        """The finished picture (null_out) as uint8 RGB, or RGBA with a clear
+        background, top row first."""
         n = self.child('null_out')
         n.cook(force=True)
-        a = n.numpyArray(delayed=False)
-        return np.ascontiguousarray(np.flipud(np.floor(a[:, :, :3] * 255 + 0.5)).astype(np.uint8))
+        a = n.numpyArray(delayed=False)[:, :, :4 if cfg.get('alpha') else 3]
+        return np.ascontiguousarray(np.flipud(np.floor(a * 255 + 0.5)).astype(np.uint8))
 
     def FastGlyphs(self, plan, cfg):
         """Glyph cells for the fast engine, checked against TouchDesigner.
@@ -550,9 +561,14 @@ class LtcGenExt:
             self.ApplyFrame(i, plan, cfg)
             want = self._picture(cfg)
             texts, flash, slot = pic.frame_state(plan, cfg, i)
-            got = pic.Compositor(cfg, layers, info).frame(i, texts, flash, slot)
+            comp = pic.Compositor(cfg, layers, info)
+            got = comp.frame(i, texts, flash, slot)
             if got.ndim == 2:
-                got = np.repeat(got[:, :, None], 3, axis=2)
+                got = got[:, :, None]
+            if comp.gray:                     # gray (+ alpha) -> RGB(A)
+                got = np.concatenate([got[:, :, :1]] * 3 + [got[:, :, 1:]], axis=2)
+            if got.shape != want.shape:
+                raise pic.PictureError(f'frame {i}: {got.shape[2]} channels, TouchDesigner has {want.shape[2]}')
             diff = int(np.abs(want.astype(np.int16) - got).max())
             if diff > 1:
                 raise pic.PictureError(f'frame {i} differs from TouchDesigner by up to {diff}/255')
@@ -689,6 +705,18 @@ class LtcGenExt:
         if pref == 'ffmpeg':
             self._status(f'Cannot render with ffmpeg fast: {why}')
             return
+        if cfg['codec'] in TD_LICENSED_CODECS and licenses.isNonCommercial:
+            # Movie File Out writes H.264/H.265 only with a Commercial or Pro
+            # licence; ffmpeg fast has no such limit.
+            if pref == 'td':
+                fix = 'set Engine to Auto'
+            elif self.install:
+                fix = 'render again once ffmpeg is installed'
+            else:
+                fix = f'it cannot run: {why}'
+            self._status(f'Cannot render: {CODECS[cfg["codec"]][0]} with a Non-Commercial licence '
+                         f'needs ffmpeg fast ({fix})')
+            return
         self._start_td(plan, audio, cfg, stem, final, note=why if pref == 'auto' else None)
 
     def _pick_engine(self, pref, cfg):
@@ -726,7 +754,7 @@ class LtcGenExt:
                 os.remove(f)
         self.pic.save_layers(paths['glyphs'], layers, info)
         keys = ('w', 'h', 'fg', 'bg', 'main', 'secondary', 'countdown', 'flash', 'marker',
-                'marker_h', 'barcode', 'strip_h')
+                'marker_h', 'barcode', 'strip_h', 'alpha')
         job = {'spec': dataclasses.asdict(plan.spec), 'audio': dataclasses.asdict(audio),
                'cfg': {k: cfg[k] for k in keys}, 'glyphs': paths['glyphs'], 'pcm': paths['pcm'],
                'out': paths['out'], 'status': paths['status'], 'log': paths['log'],
@@ -1130,7 +1158,8 @@ class LtcGenExt:
             j['retimed'] = f'{written.numerator}/{written.denominator}'
         cmd = self.ff.mux_command(self.ffinfo.path, j['video'], pcm, j['mux_out'],
                                   timecode=plan.embedded_timecode if j['cfg']['tctrack'] else None,
-                                  progress_path=j['progress'], retime=retime)
+                                  progress_path=j['progress'], retime=retime,
+                                  bt709=j['cfg']['codec'] == 'prores4444')
         j['log_path'] = j['stem'] + '.mux.log'
         j['log'] = open(j['log_path'], 'wb')
         kw = {'creationflags': 0x08000000} if os.name == 'nt' else {}
@@ -1186,6 +1215,8 @@ class LtcGenExt:
             problems.append(f"size {got.get('width')}x{got.get('height')}, expected {cfg['w']}x{cfg['h']}")
         if cfg['tctrack'] and got.get('timecode') not in (None, plan.embedded_timecode):
             problems.append(f"timecode track {got.get('timecode')}, expected {plan.embedded_timecode}")
+        if cfg.get('alpha') and not problems:
+            problems += self._alpha_problems(j)
         if problems:
             bad = j['stem'] + '.UNVERIFIED.mov'
             os.replace(j['mux_out'], bad)
@@ -1205,6 +1236,23 @@ class LtcGenExt:
             return
         self._set('Lastfile', j['final'])
         self._end_job(message, keep=False, progress=1.0)
+
+    def _alpha_problems(self, j):
+        """A clear-background movie must decode with alpha: clear somewhere,
+        opaque somewhere, on a frame that is not a sync flash."""
+        plan, cfg = j['plan'], j['cfg']
+        clear = next((i for i in range(min(plan.video_frames, 3))
+                      if not self.pic.frame_state(plan, cfg, i)[1]), None)
+        if clear is None:
+            return []
+        got = self.ff.alpha_range(self.ffinfo.path, j['mux_out'], clear, cfg['w'], cfg['h'])
+        if got is None:
+            return [f'could not read frame {clear} back']
+        # TouchDesigner's ProRes 4444 stores clear as 15/4095, which reads as 1.
+        # Tiny pictures may never reach 255 (measured 188 at 32x16).
+        if got[0] > 1 or got[1] < 16:
+            return [f'alpha in frame {clear} ranges {got[0]}-{got[1]}, expected clear (0) and visible text']
+        return []
 
     def _end_job(self, message, keep, progress=None):
         """Stop everything and clean up. keep=True leaves the video and LTC files."""
@@ -1492,7 +1540,10 @@ class LtcGenExt:
             self.BatchRender()
 
     def OnParChange(self, par):
-        if par.name in ('Status', 'Progress', 'Summary', 'Ffmpegstatus', 'Ffmpegready', 'Rendering', 'Batchcount'):
+        # Read-only values the extension writes. Lastfile changes as a job ends:
+        # refreshing then would replace the "Done: ..." message with "Ready".
+        if par.name in ('Status', 'Progress', 'Summary', 'Ffmpegstatus', 'Ffmpegready', 'Rendering', 'Batchcount',
+                        'Estimate', 'Outputfile', 'Lastfile'):
             return
         if par.name in ('Ffmpegsource', 'Ffmpegpath', 'Shareffmpeg'):
             self.CheckFfmpeg(force=True)

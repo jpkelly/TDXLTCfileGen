@@ -349,6 +349,21 @@ def probe_movie(ffmpeg: str, ffprobe: str | None, path: str, timeout: float = 60
     return out
 
 
+def alpha_range(ffmpeg: str, path: str, frame: int, w: int, h: int,
+                timeout: float = 60.0) -> tuple[int, int] | None:
+    """(lowest, highest) 8-bit alpha in video frame ``frame`` of a finished
+    movie, or None if it could not be decoded. A stream without alpha
+    decodes as fully opaque: (255, 255)."""
+    r = _run([ffmpeg, "-hide_banner", "-nostdin", "-v", "error", "-i", path, "-map", "0:v:0",
+              "-vf", f"select=eq(n\\,{int(frame)})", "-frames:v", "1",
+              "-f", "rawvideo", "-pix_fmt", "rgba", "-"], timeout)
+    if r.returncode or len(r.stdout) != w * h * 4:
+        return None
+    import numpy as np
+    a = np.frombuffer(r.stdout, np.uint8)[3::4]
+    return int(a.min()), int(a.max())
+
+
 # ----------------------------------------------------------------------
 # Mux
 
@@ -385,10 +400,12 @@ def video_rate(ffmpeg: str, ffprobe: str | None, path: str, timeout: float = 30.
 
 def mux_command(ffmpeg: str, video: str, pcm: dict, out: str,
                 timecode: str | None = None, progress_path: str | None = None,
-                retime: Fraction | None = None) -> list[str]:
+                retime: Fraction | None = None, bt709: bool = False) -> list[str]:
     """Copy the video untouched and add the raw PCM LTC track.
 
     ``pcm`` is the dict returned by ``LtcEncoder.write_pcm``.
+
+    ``bt709`` relabels a ProRes stream's colour matrix as BT.709.
 
     ``retime`` rescales the video timestamps (still a stream copy) by
     ``written_rate / wanted_rate``. TouchDesigner's Movie File Out writes a
@@ -407,9 +424,17 @@ def mux_command(ffmpeg: str, video: str, pcm: dict, out: str,
            "-map", "0:v:0", "-map", "1:a:0",
            "-c:v", "copy", "-c:a", codec,
            "-metadata:s:a:0", "title=LTC", "-metadata:s:a:0", "handler_name=LTC"]
+    bsf = []
     if retime is not None and retime != 1:
         a, b = retime.numerator, retime.denominator
-        cmd += ["-bsf:v", f"setts=pts=PTS*{a}/{b}:dts=DTS*{a}/{b}:duration=DURATION*{a}/{b}"]
+        bsf.append(f"setts=pts=PTS*{a}/{b}:dts=DTS*{a}/{b}:duration=DURATION*{a}/{b}")
+    if bt709:
+        # ProRes 4444 from TouchDesigner: BT.709 pixels labelled BT.601, in
+        # every frame header and in the container. Relabel both (no re-encode).
+        bsf.append("prores_metadata=colorspace=bt709")
+        cmd += ["-colorspace", "bt709"]
+    if bsf:
+        cmd += ["-bsf:v", ",".join(bsf)]
     if timecode:
         cmd += ["-timecode", timecode]
     if progress_path:
@@ -445,11 +470,15 @@ _H26X_RATE = ("-maxrate", "10M", "-bufsize", "20M", "-g", "15")   # TD: 10 Mb/s 
 #: peak cap keeps mostly-black timecode files small.
 FAST_ENCODERS: dict[str, tuple[FastEncoder, ...]] = {
     "hap": (FastEncoder("hap", ("-format", "hap", "-chunks", "12", "-compressor", "snappy"), "rgba", False),),
+    "hapalpha": (FastEncoder("hap", ("-format", "hap_alpha", "-chunks", "12", "-compressor", "snappy"),
+                             "rgba", False),),
     "hapq": (FastEncoder("hap", ("-format", "hap_q", "-chunks", "12", "-compressor", "snappy"), "rgba", False),),
     "prores422hq": (FastEncoder("prores_videotoolbox", ("-profile:v", "hq"), "p210le", True),
                     FastEncoder("prores_ks", ("-profile:v", "3", "-vendor", "apl0"), "yuv422p10le", True)),
     "prores422": (FastEncoder("prores_videotoolbox", ("-profile:v", "standard"), "p210le", True),
                   FastEncoder("prores_ks", ("-profile:v", "2", "-vendor", "apl0"), "yuv422p10le", True)),
+    "prores4444": (FastEncoder("prores_videotoolbox", ("-profile:v", "4444"), "ayuv64le", True),
+                   FastEncoder("prores_ks", ("-profile:v", "4", "-vendor", "apl0"), "yuva444p10le", True)),
     "h264": (FastEncoder("libx264", ("-preset", "fast", "-profile:v", "high", "-crf", "18") + _H26X_RATE,
                          "yuv420p", True),
              FastEncoder("h264_videotoolbox", ("-profile:v", "high", "-b:v", "8M") + _H26X_RATE,
@@ -503,13 +532,19 @@ def fast_encoder(ffmpeg: str, codec: str) -> FastEncoder | None:
     return None
 
 
-def encode_command(ffmpeg: str, enc: FastEncoder, w: int, h: int, gray: bool, rate: Fraction,
+#: Raw frame formats encode_command accepts (ltcfilegen.picture.PIX_FMTS).
+SOURCE_FORMATS = ("gray", "rgb24", "ya8", "rgba")
+
+
+def encode_command(ffmpeg: str, enc: FastEncoder, w: int, h: int, src_fmt: str, rate: Fraction,
                    pcm: dict, out: str, timecode: str | None = None) -> list[str]:
-    """Encode raw frames from stdin (8-bit gray or RGB, top row first, full
-    range) and add the PCM LTC track in one pass."""
+    """Encode raw frames from stdin (8-bit ``src_fmt``: gray, rgb24, ya8 or
+    rgba; top row first, full range) and add the PCM LTC track in one pass."""
+    if src_fmt not in SOURCE_FORMATS:
+        raise ValueError(f"unknown frame format {src_fmt!r}")
     acodec = {"s16le": "pcm_s16le", "s24le": "pcm_s24le"}[pcm["format"]]
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y",
-           "-f", "rawvideo", "-pix_fmt", "gray" if gray else "rgb24", "-color_range", "pc",
+           "-f", "rawvideo", "-pix_fmt", src_fmt, "-color_range", "pc",
            "-s", f"{w}x{h}", "-framerate", f"{rate.numerator}/{rate.denominator}", "-i", "pipe:0",
            "-f", pcm["format"], "-ar", str(pcm["sample_rate"]), "-ac", str(pcm["channels"]),
            "-i", pcm["path"],

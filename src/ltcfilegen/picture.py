@@ -18,6 +18,12 @@ encoder far faster than TouchDesigner's loop runs:
 * :class:`Compositor` repeats the shader's arithmetic and redraws only the
   pixels that change from one frame to the next.
 
+With ``cfg["alpha"]`` (HAP Alpha, ProRes 4444) the background is clear: each
+pixel's alpha is the weight the opaque picture gives the text colour over
+the background, and the colour is premultiplied (text colour x alpha), as
+TouchDesigner plays such files back. Flash frames and the debug barcode stay
+opaque.
+
 Arrays are top row first (as encoders expect). TouchDesigner's
 ``numpyArray()`` is bottom row first: flip it before building layers.
 """
@@ -249,19 +255,27 @@ def _mix(x, y, a):
     return x * (np.float32(1) - a) + y * a
 
 
+#: Raw frame format by (gray, alpha), as ffmpeg names it.
+PIX_FMTS = {(True, False): "gray", (False, False): "rgb24", (True, True): "ya8", (False, True): "rgba"}
+
+
 class Compositor:
     """Frames of the timecode picture, as the shader draws them.
 
     ``layers`` maps names in :data:`LINES` to :class:`TextLayer` or None;
     ``info`` is the caption's full-frame uint8 alpha or None. ``cfg`` needs
     w, h, fg, bg, marker, marker_h, barcode and strip_h, plus ``slots`` (frames
-    per second shown by the marker).
+    per second shown by the marker) and optionally ``alpha``.
+
+    Frames are gray, RGB, gray + alpha or RGBA (:attr:`pix_fmt`).
     """
 
     def __init__(self, cfg: dict, layers: dict, info: np.ndarray | None = None):
         self.w, self.h = int(cfg["w"]), int(cfg["h"])
         self.gray = is_gray(cfg)
-        self.ch = 1 if self.gray else 3
+        self.alpha = bool(cfg.get("alpha"))
+        self.ch = 1 if self.gray else 3                 # colour channels
+        self.pix_fmt = PIX_FMTS[(self.gray, self.alpha)]
         fg = np.array(cfg["fg"], np.float32)[: self.ch]
         bg = np.array(cfg["bg"], np.float32)[: self.ch]
         self.layers = {k: v for k, v in layers.items() if v is not None}
@@ -281,11 +295,24 @@ class Compositor:
         self.lut, self.marker_on, self.marker_dim = {}, {}, {}
         for flash in (False, True):
             b, f = (fg, bg) if flash else (bg, fg)
+            if self.alpha and not flash:
+                # Clear background: alpha = the text colour's weight, colour premultiplied.
+                t = _mix(np.float32(0), np.float32(1), a)
+                t = _mix(t, np.float32(1), ai * np.float32(INFO_WEIGHT))
+                self.lut[flash] = np.concatenate([_q(f * t), _q(t)], axis=-1)
+                self.marker_on[flash] = np.concatenate([_q(f), [255]]).astype(np.uint8)
+                dim = np.float32(MARKER_DIM)
+                self.marker_dim[flash] = np.concatenate([_q(f * dim), _q([dim])]).astype(np.uint8)
+                continue
             col = _mix(b, f, a)
             col = _mix(col, f, ai * np.float32(INFO_WEIGHT))
-            self.lut[flash] = _q(col)                       # (256, 256, ch)
-            self.marker_on[flash] = _q(f)
-            self.marker_dim[flash] = _q(_mix(b, f, MARKER_DIM))
+            on, dim = _q(f), _q(_mix(b, f, MARKER_DIM))
+            if self.alpha:                                  # flash frames stay opaque
+                col = np.concatenate([col, np.ones(col.shape[:2] + (1,), np.float32)], axis=-1)
+                on, dim = (np.concatenate([v, [255]]).astype(np.uint8) for v in (on, dim))
+            self.lut[flash] = _q(col)                       # (256, 256, channels)
+            self.marker_on[flash] = on
+            self.marker_dim[flash] = dim
 
         # Frame marker geometry (shader: px = pixel centre, y from the bottom).
         self.marker = bool(cfg.get("marker"))
@@ -315,7 +342,7 @@ class Compositor:
         self.bar_cols = [tuple(int(v) for v in (np.flatnonzero(bar == k)[[0, -1]] + [0, 1]))
                          if (bar == k).any() else (0, 0) for k in range(24)]
 
-        self.out = np.zeros(shape + ((self.ch,) if self.ch > 1 else ()), np.uint8)
+        self.out = np.zeros(shape + (self.ch + self.alpha,), np.uint8)
         self.prev = None            # (digits per line, flash, slot, i) of the last frame
 
     # ------------------------------------------------------------------
@@ -348,7 +375,7 @@ class Compositor:
             for r in rects:
                 self._draw(r, flash, slot, i)
         self.prev = (digits, flash, slot, i)
-        return self.out
+        return self.out[..., 0] if self.out.shape[2] == 1 else self.out
 
     def _full(self, digits, flash, slot, i):
         for name, ds in digits.items():
@@ -370,8 +397,7 @@ class Compositor:
             a = canvas[y0:y1, x0:x1] if a is None else np.maximum(a, canvas[y0:y1, x0:x1])
         if a is None:
             a = np.zeros((y1 - y0, x1 - x0), np.uint8)
-        col = self.lut[flash][a, self.info[y0:y1, x0:x1]]
-        self.out[y0:y1, x0:x1] = col if self.ch > 1 else col[..., 0]
+        self.out[y0:y1, x0:x1] = self.lut[flash][a, self.info[y0:y1, x0:x1]]
         if self.marker:
             self._draw_marker(rect, flash, slot)
         if self.barcode:
@@ -385,8 +411,7 @@ class Compositor:
         for s, (a, b) in self.slot_cols.items():
             c0, c1 = max(x0, a), min(x1, b)
             if c1 > c0:
-                v = self.marker_on[flash] if s == slot else self.marker_dim[flash]
-                self.out[r0:r1, c0:c1] = v if self.ch > 1 else v[0]
+                self.out[r0:r1, c0:c1] = self.marker_on[flash] if s == slot else self.marker_dim[flash]
 
     def _draw_barcode(self, rect, i):
         y0, y1, x0, x1 = rect
@@ -401,7 +426,8 @@ class Compositor:
             bit = (f >> k) & 1
             for r0, r1, v in ((s0, min(s1, self.strip_mid), bit), (max(s0, self.strip_mid), s1, 1 - bit)):
                 if r1 > r0:
-                    self.out[r0:r1, c0:c1] = 255 * v
+                    self.out[r0:r1, c0:c1, :self.ch] = 255 * v
+                    self.out[r0:r1, c0:c1, self.ch:] = 255      # opaque
 
 
 def save_layers(path: str, layers: dict, info: np.ndarray | None) -> None:

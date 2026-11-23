@@ -142,10 +142,13 @@ def _shader(plan, cfg, layers, info, i):
     bg, fg = np.float32(cfg["bg"]), np.float32(cfg["fg"])
     if flash:
         bg, fg = fg, bg
+    clear = cfg.get("alpha") and not flash
     col = bg * (1 - a[..., None]) + fg * a[..., None]
+    t = a[..., None]                                   # text weight = alpha when clear
     if info is not None:
         ai = info.astype(np.float32)[..., None] / 255 * np.float32(0.7)
         col = col * (1 - ai) + fg * ai
+        t = t * (1 - ai) + ai
     yb = (H - 1 - np.arange(H, dtype=np.float32))[:, None] + np.float32(0.5)   # px.y from the bottom
     px = np.arange(W, dtype=np.float32)[None, :] + np.float32(0.5)
     if cfg["marker"]:
@@ -157,33 +160,79 @@ def _shader(plan, cfg, layers, info, i):
         dim = inner & (s != slot)
         col = np.where(on[..., None], fg, col)
         col = np.where(dim[..., None], bg * np.float32(0.8) + fg * np.float32(0.2), col)
+        t = np.where(on[..., None], np.float32(1), t)
+        t = np.where(dim[..., None], np.float32(0.2), t)
+    if cfg.get("alpha"):
+        col = np.concatenate([fg * t, t] if clear else [col, np.ones_like(t)], axis=-1)
     if cfg["barcode"]:
         strip = yb >= H - cfg["strip_h"]
         bar = np.floor(px / np.float32(W) * 24).astype(np.int64)
         bit = ((i >> bar) & 1).astype(np.float32)
         upper = yb >= H - 0.5 * cfg["strip_h"]
-        v = np.where(upper, bit, 1 - bit)
-        col = np.where(strip[..., None], np.broadcast_to(v[..., None], col.shape), col)
+        v = np.where(upper, bit, 1 - bit)[..., None]
+        if cfg.get("alpha"):
+            v = np.concatenate([v, v, v, np.ones_like(v)], axis=-1)
+        col = np.where(strip[..., None], np.broadcast_to(v, col.shape), col)
     out = np.clip(np.floor(col * 255 + 0.5), 0, 255).astype(np.uint8)
     return out
 
 
+def _as_shader(got, comp):
+    """Compositor output (gray, RGB, gray + alpha or RGBA) as the shader's RGB(A)."""
+    if got.ndim == 2:
+        got = got[..., None]
+    if comp.gray:
+        got = np.concatenate([got[..., :1]] * 3 + [got[..., 1:]], axis=-1)
+    return got
+
+
 @pytest.mark.parametrize("colour", [False, True])
-def test_compositor_matches_the_shader(colour):
-    plan, cfg, layers, info, _ = _setup(colour=colour)
+@pytest.mark.parametrize("alpha", [False, True])
+def test_compositor_matches_the_shader(colour, alpha):
+    plan, cfg, layers, info, _ = _setup(colour=colour, alpha=alpha)
     comp = pic.Compositor(cfg, layers, info)
     for i in (0, 1, 59, 60, 61, 119, 120, plan.video_frames - 1):
         texts, flash, slot = pic.frame_state(plan, cfg, i)
-        got = pic.Compositor(cfg, layers, info).frame(i, texts, flash, slot)
+        got = _as_shader(pic.Compositor(cfg, layers, info).frame(i, texts, flash, slot), comp)
         want = _shader(plan, cfg, layers, info, i)
-        if got.ndim == 2:
-            assert comp.gray
-            want = want[..., 0]
+        assert got.shape == want.shape
         assert int(np.abs(got.astype(np.int16) - want).max()) <= 1, i
 
 
+@pytest.mark.parametrize("colour", [False, True])
+def test_clear_background_over_the_background_colour_is_the_opaque_picture(colour):
+    """Premultiplied: colour + background x (1 - alpha) gives back the opaque frame."""
+    plan, cfg, layers, info, _ = _setup(colour=colour, barcode=False)
+    clear = pic.Compositor(dict(cfg, alpha=True), layers, info)
+    solid = pic.Compositor(cfg, layers, info)
+    bg = np.float32(cfg["bg"]) * 255
+    for i in (1, 2, 61, plan.video_frames - 1):
+        st = pic.frame_state(plan, cfg, i)
+        assert not st[1]
+        c = _as_shader(clear.frame(i, *st), clear).astype(np.float32)
+        over = c[..., :3] + bg * (1 - c[..., 3:] / 255)
+        want = _as_shader(solid.frame(i, *st), solid).astype(np.float32)
+        assert np.abs(over - want).max() <= 2, i
+
+
+def test_clear_frames_are_clear_except_flash_and_barcode():
+    plan, cfg, layers, info, _ = _setup(alpha=True)
+    comp = pic.Compositor(cfg, layers, info)
+    flash_i = next(i for i in range(1, 200) if pic.frame_state(plan, cfg, i)[1])
+    f = comp.frame(flash_i, *pic.frame_state(plan, cfg, flash_i)).copy()
+    assert f.shape == (H, W, 2) and (f[..., 1] == 255).all()
+    f = comp.frame(flash_i + 1, *pic.frame_state(plan, cfg, flash_i + 1))
+    body = f[cfg["strip_h"]:]                          # below the barcode
+    assert body[..., 1].min() == 0 and body[..., 1].max() == 255
+    assert (body[..., 0] <= body[..., 1]).all()         # premultiplied white
+    assert (f[:cfg["strip_h"], :, 1] == 255).all()      # the barcode is opaque
+    dim = f[H - cfg["marker_h"] // 2, :, 1]
+    assert 51 in dim                                    # unlit marker slots at 20 %
+
+
 @pytest.mark.parametrize("opts", [{}, {"colour": True}, {"flash": False, "barcode": False},
-                                  {"rate": "25", "df": False, "start": "23:59:58:00"}])
+                                  {"rate": "25", "df": False, "start": "23:59:58:00"},
+                                  {"alpha": True}, {"alpha": True, "colour": True}])
 def test_incremental_frames_equal_full_redraws(opts):
     """Only changed cells are redrawn; the result must not depend on that."""
     plan, cfg, layers, info, _ = _setup(**opts)
@@ -195,11 +244,14 @@ def test_incremental_frames_equal_full_redraws(opts):
         assert np.array_equal(a, b), i
 
 
-def test_gray_pictures_use_one_channel():
-    plan, cfg, layers, info, _ = _setup()
-    assert pic.Compositor(cfg, layers, info).frame(0, *pic.frame_state(plan, cfg, 0)).ndim == 2
-    plan, cfg, layers, info, _ = _setup(colour=True)
-    assert pic.Compositor(cfg, layers, info).frame(0, *pic.frame_state(plan, cfg, 0)).shape == (H, W, 3)
+@pytest.mark.parametrize("colour, alpha, shape, fmt", [
+    (False, False, (H, W), "gray"), (True, False, (H, W, 3), "rgb24"),
+    (False, True, (H, W, 2), "ya8"), (True, True, (H, W, 4), "rgba")])
+def test_frames_use_as_few_channels_as_they_need(colour, alpha, shape, fmt):
+    plan, cfg, layers, info, _ = _setup(colour=colour, alpha=alpha)
+    comp = pic.Compositor(cfg, layers, info)
+    f = comp.frame(0, *pic.frame_state(plan, cfg, 0))
+    assert f.shape == shape and comp.pix_fmt == fmt and f.flags.c_contiguous
 
 
 def test_frame_state_follows_the_readout_settings():

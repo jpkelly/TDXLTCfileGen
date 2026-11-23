@@ -25,6 +25,8 @@ Requires numpy (bundled with TouchDesigner).
 from __future__ import annotations
 
 import math
+import os
+import wave
 from dataclasses import dataclass
 
 import numpy as np
@@ -233,3 +235,57 @@ class LtcEncoder:
                     progress(min(a + chunk, self.total) / self.total)
         return {"path": path, "samples": self.total, "sample_rate": self.sr,
                 "channels": self.opts.channels, "format": self.opts.ffmpeg_format}
+
+    def write_wav(self, path: str, chunk: int = 1 << 19, progress=None, cancelled=None) -> bool:
+        """Write the whole track as a WAV file. False if ``cancelled()`` said stop."""
+        check_wav_size(self.total, self.opts)
+        with wave.open(path, "wb") as w:
+            _wav_format(w, self.opts)
+            for a in range(0, self.total, chunk):
+                if cancelled and cancelled():
+                    return False
+                w.writeframesraw(self.to_pcm(self.render(a, a + chunk)))
+                if progress:
+                    progress(min(a + chunk, self.total) / self.total)
+        return True
+
+
+#: WAV sizes are 32-bit: about 4 h of 48 kHz 24-bit stereo.
+WAV_MAX_BYTES = 0xFFFFFFFF - 36
+
+
+def check_wav_size(samples: int, opts: AudioOptions) -> None:
+    size = samples * opts.channels * (opts.bit_depth // 8)
+    if size > WAV_MAX_BYTES:
+        hours = WAV_MAX_BYTES / (opts.sample_rate * opts.channels * (opts.bit_depth // 8)) / 3600
+        raise ValueError(f"a WAV file holds at most {hours:.1f} h at these audio settings "
+                         f"(use a shorter duration, 16-bit or mono)")
+
+
+def _wav_format(w, opts: AudioOptions) -> None:
+    w.setnchannels(opts.channels)
+    w.setsampwidth(opts.bit_depth // 8)
+    w.setframerate(opts.sample_rate)
+
+
+def pcm_to_wav(pcm_path: str, wav_path: str, opts: AudioOptions, chunk: int = 1 << 22,
+               progress=None, cancelled=None) -> bool:
+    """Wrap a raw PCM file (as written by :meth:`LtcEncoder.write_pcm`) in a WAV
+    header. False if ``cancelled()`` said stop."""
+    frame = opts.channels * (opts.bit_depth // 8)
+    size = os.path.getsize(pcm_path)
+    check_wav_size(size // frame, opts)
+    done = 0
+    with open(pcm_path, "rb") as src, wave.open(wav_path, "wb") as w:
+        _wav_format(w, opts)
+        while True:
+            if cancelled and cancelled():
+                return False
+            data = src.read(chunk - chunk % frame)
+            if not data:
+                break
+            w.writeframesraw(data)
+            done += len(data)
+            if progress:
+                progress(done / size if size else 1.0)
+    return True

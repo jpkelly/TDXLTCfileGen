@@ -40,7 +40,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import wave
 
 # key: (label, videocodec, videocodectype, pixel format, size multiple)
 CODECS = {
@@ -64,6 +66,12 @@ EST_LOOP_SHARE = 0.9
 #: picture option on, M4 Max), scaled by pixel count for other sizes.
 FAST_EST_FPS = {'hap': 500, 'hapq': 400, 'prores422hq': 400, 'prores422': 400,
                 'h264': 400, 'h265': 150}
+
+#: WAV only: seconds of LTC written per second (1 h in about 10 s on an M4 Max).
+WAV_SPEED = 300
+
+#: File type menu (Output): extensions each one writes.
+OUTPUT_EXTS = {'movie': ('.mov',), 'moviewav': ('.mov', '.wav'), 'wav': ('.wav',)}
 
 #: Where people find the documentation (shown in the help dialog).
 DOCS_URL = 'https://github.com/jpkelly/TDXLTCfileGen'
@@ -97,7 +105,7 @@ def render_cook_rate():
 
 #: Engine modules the component carries in ./engine (the DAT 'init' holds
 #: __init__.py). Keep in step with src/ltcfilegen.
-ENGINE_MODULES = ('__init__', 'timecode', 'job', 'ltc', 'ffmpeg', 'picture', 'fastrender', 'decode')
+ENGINE_MODULES = ('__init__', 'timecode', 'job', 'ltc', 'ffmpeg', 'picture', 'fastrender', 'wavwrite', 'decode')
 
 
 def _user_data_dir():
@@ -181,7 +189,8 @@ def _label_for_file(text):
 
 
 class LtcGenExt:
-    """Promoted: Render, Cancel, Refresh, ApplyFrame, CheckFfmpeg, InstallFfmpeg, ShowSettings."""
+    """Promoted: Render, Cancel, Refresh, ApplyFrame, CheckFfmpeg, InstallFfmpeg, ShowSettings,
+    ShowInFinder, RevealLabel."""
 
     def __init__(self, ownerComp):
         self.ownerComp = ownerComp
@@ -322,7 +331,10 @@ class LtcGenExt:
             'fg': (float(p.Textcolorr), float(p.Textcolorg), float(p.Textcolorb)),
             'bg': (float(p.Bgcolorr), float(p.Bgcolorg), float(p.Bgcolorb)),
             'tctrack': bool(p.Timecodetrack.eval()),
+            'output': p.Output.eval() if hasattr(p, 'Output') else 'movie',
         }
+        if cfg['output'] in ('wav', 'moviewav'):
+            self.ltc.check_wav_size(plan.total_samples(audio.sample_rate), audio)
         cfg['strip_h'] = self.barcode_strip_height(h)
         cfg['marker_h'] = max(8, int(round(h / 40.0)) // 2 * 2)
         cfg['info_text'] = self._info_text(plan, audio, cfg)
@@ -358,7 +370,10 @@ class LtcGenExt:
         self.plan, self.audio, self.cfg = plan, audio, cfg
         secs = plan.video_frames / float(plan.rate.fps)
         pref = self.pars.Engine.eval() if hasattr(self.pars, 'Engine') else 'auto'
-        if pref != 'td' and cfg['codec'] in FAST_EST_FPS and self.ffinfo is not None:
+        if cfg['output'] == 'wav':
+            how = 'WAV only'
+            est = secs / WAV_SPEED
+        elif pref != 'td' and cfg['codec'] in FAST_EST_FPS and self.ffinfo is not None:
             how = 'ffmpeg fast'
             est = plan.video_frames / (FAST_EST_FPS[cfg['codec']] * 1920 * 1080 / (cfg['w'] * cfg['h']))
         else:
@@ -370,7 +385,8 @@ class LtcGenExt:
                              f"{int(secs // 3600)}:{int(secs % 3600 // 60):02d}:{secs % 60:05.2f}")
         self._set('Estimate', f'{when} ({how})')
         try:
-            name = self._filename(plan, cfg) + '.mov'
+            name = self._filename(plan, cfg) + {'movie': '.mov', 'moviewav': '.mov + .wav',
+                                                'wav': '.wav'}[cfg['output']]
         except ValueError as exc:
             name = f'(file name: {exc})'
         folder = self.pars.Outputfolder.eval()
@@ -632,13 +648,18 @@ class LtcGenExt:
         except ValueError as exc:
             self._status(f'Cannot render: {exc}')
             return
-        final = stem + '.mov'
-        if os.path.exists(final) and not self.pars.Overwrite.eval():
+        exts = OUTPUT_EXTS[cfg['output']]
+        if not self.pars.Overwrite.eval() and any(os.path.exists(stem + e) for e in exts):
             n = 2
-            while os.path.exists(f'{stem}_{n}.mov'):
+            while any(os.path.exists(f'{stem}_{n}{e}') for e in exts):
                 n += 1
             stem = f'{stem}_{n}'
-            final = stem + '.mov'
+        final = stem + exts[0]
+        self._set('Lastfile', '')
+
+        if cfg['output'] == 'wav':                 # no video and no ffmpeg needed
+            self._start_wav_only(plan, audio, cfg, stem, final)
+            return
 
         ffinfo = self.CheckFfmpeg(force=True)
         in_batch = getattr(self, '_batch_restore', None) is not None
@@ -939,6 +960,114 @@ class LtcGenExt:
                 except (OSError, ValueError):
                     pass
 
+    # ------------------------------------------------------------------
+    # WAV (File type: WAV only, or Movie + WAV after the movie is checked).
+    # Written in a background thread (an hour takes about 10 s), checked by
+    # reading the header back, then renamed into place.
+
+    def _start_wav_only(self, plan, audio, cfg, stem, final):
+        self._claim([stem + '.partial.wav'])
+        self.job = {'state': 'wav', 'engine': 'WAV', 'plan': plan, 'cfg': cfg, 'audio': audio,
+                    'enc': self.ltc.LtcEncoder(plan, audio), 'pcm_path': None, 'video': None,
+                    'final': final, 'stem': stem, 't0': time.time(), 'proc': None, 'log': None,
+                    'temp': []}
+        self._begin_wav(self.job, None)
+        self._set('Progress', 0.0)
+        self._set('Rendering', True)
+        self._status(f'Writing {os.path.basename(final)}')
+
+    def _begin_wav(self, j, pcm):
+        """Write stem.wav from the encoder (pcm None) or from the movie's raw LTC."""
+        j['state'] = 'wav'
+        j['wav_partial'] = j['stem'] + '.partial.wav'
+        j['temp'] = j.get('temp', []) + [j['wav_partial']]
+        st = j['wav_status'] = {'fraction': 0.0, 'done': False, 'ok': False, 'error': None}
+        enc, audio, partial, ltc = j['enc'], j['audio'], j['wav_partial'], self.ltc
+        py = self.ff.python_for_worker()
+        if py:
+            # A separate process: Python threads inside TouchDesigner get little
+            # time (an hour took 98 s in a thread, about 10 s in a process).
+            job_path, status_path, log_path = (j['stem'] + x for x in ('.wav.json', '.wav.status', '.wav.log'))
+            for f in (job_path, status_path, log_path):
+                if os.path.exists(f):
+                    os.remove(f)
+            with open(job_path, 'w') as fh:
+                json.dump({'spec': dataclasses.asdict(j['plan'].spec), 'audio': dataclasses.asdict(audio),
+                           'out': partial, 'status': status_path, 'pcm': pcm}, fh)
+            env = dict(os.environ)
+            env['PYTHONPATH'] = self._src + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+            kw = {'creationflags': 0x08000000} if os.name == 'nt' else {}
+            log = open(log_path, 'wb')
+            j['wav_proc'] = subprocess.Popen([py, '-m', 'ltcfilegen.wavwrite', job_path], stdout=log, stderr=log,
+                                             stdin=subprocess.DEVNULL, env=env, cwd=self._src, **kw)
+            log.close()
+            j['wav_status_path'] = status_path
+            j['temp'] += [job_path, status_path, status_path + '.tmp', log_path]
+            j['pids'] = j.get('pids', []) + [j['wav_proc'].pid]
+            self._store_active(j)
+            return
+        stop = j['wav_cancel'] = threading.Event()
+
+        def work():                                  # no TouchDesigner calls in here
+            try:
+                progress = lambda f: st.update(fraction=f)
+                if pcm:
+                    st['ok'] = ltc.pcm_to_wav(pcm, partial, audio, progress=progress, cancelled=stop.is_set)
+                else:
+                    st['ok'] = enc.write_wav(partial, progress=progress, cancelled=stop.is_set)
+            except Exception as exc:
+                st['error'] = f'{type(exc).__name__}: {exc}'
+            finally:
+                st['done'] = True
+
+        j['wav_thread'] = threading.Thread(target=work, name='LTC WAV', daemon=True)
+        j['wav_thread'].start()
+        self._store_active(j)
+
+    def _tick_wav(self, j):
+        st = j['wav_status']
+        proc = j.get('wav_proc')
+        if proc is not None and not st['done']:
+            try:
+                with open(j['wav_status_path']) as fh:
+                    info = json.load(fh)
+            except (OSError, ValueError):
+                info = {}
+            st['fraction'] = info.get('fraction', st['fraction'])
+            rc = proc.poll()
+            if rc is not None:
+                st['done'] = True
+                st['ok'] = rc == 0 and info.get('phase') == 'done'
+                if not st['ok']:
+                    st['error'] = info.get('error') or self._tail(j['stem'] + '.wav.log') or f'exit code {rc}'
+        if not st['done']:
+            base = 0.95 if j.get('movie_done') else 0.0
+            self._set('Progress', round(base + (1 - base) * st['fraction'], 4))
+            self._status(f"Writing {os.path.basename(j['stem'])}.wav  ({int(100 * st['fraction'])}%)", log=False)
+            return
+        if st['error']:
+            raise RuntimeError(f"WAV not written: {st['error']}")
+        if not st['ok']:
+            return                                   # cancelled; Cancel ends the job
+        wav = j['stem'] + '.wav'
+        with wave.open(j['wav_partial']) as w:
+            got = (w.getnframes(), w.getframerate(), w.getnchannels())
+        want = (j['enc'].total, j['audio'].sample_rate, j['audio'].channels)
+        if got != want:
+            raise RuntimeError(f'WAV check failed: {got[0]} samples at {got[1]} Hz x {got[2]}, '
+                               f'expected {want[0]} at {want[1]} Hz x {want[2]}')
+        os.replace(j['wav_partial'], wav)
+        secs = time.time() - j['t0']
+        took = f'{int(secs // 60)}:{int(secs % 60):02d}'
+        if j.get('movie_done'):
+            message = j['movie_done'].replace('.mov  (', '.mov + .wav  (', 1)
+        else:
+            length = j['plan'].video_frames / float(j['plan'].rate.fps)
+            message = (f'Done: {os.path.basename(wav)}  ({int(length // 3600)}:{int(length % 3600 // 60):02d}:'
+                       f'{length % 60:05.2f} of LTC, {took})')
+        self._set('Lastfile', j['final'])
+        self._end_job(message, keep=False, progress=1.0)
+
     def _tick_arm(self, j):
         j['ticks'] += 1
         if j['ticks'] >= 2:
@@ -1068,8 +1197,14 @@ class LtcGenExt:
                 if j.get('retimed') else '')
         if j.get('engine') == 'ffmpeg fast':
             note += ', ffmpeg fast'
-        self._end_job(f'Done: {os.path.basename(j["final"])}  ({plan.video_frames:,} frames, '
-                      f'{int(secs // 60)}:{int(secs % 60):02d}{note})', keep=False, progress=1.0)
+        message = (f'Done: {os.path.basename(j["final"])}  ({plan.video_frames:,} frames, '
+                   f'{int(secs // 60)}:{int(secs % 60):02d}{note})')
+        if cfg.get('output') == 'moviewav':
+            j['movie_done'] = message                # the WAV comes from the same LTC
+            self._begin_wav(j, j['pcm_path'])
+            return
+        self._set('Lastfile', j['final'])
+        self._end_job(message, keep=False, progress=1.0)
 
     def _end_job(self, message, keep, progress=None):
         """Stop everything and clean up. keep=True leaves the video and LTC files."""
@@ -1083,6 +1218,11 @@ class LtcGenExt:
         except Exception:
             pass
         if j:
+            if j.get('wav_cancel') is not None:      # stop a WAV still being written
+                j['wav_cancel'].set()
+                j['wav_thread'].join(timeout=2)
+            if j.get('wav_proc') is not None and j['wav_proc'].poll() is None:
+                j['wav_proc'].kill()
             proc = j.get('proc')
             if proc and proc.poll() is None:
                 # Still running (cancel, failure): stop the fast worker's ffmpeg
@@ -1115,8 +1255,9 @@ class LtcGenExt:
                     delayFrames=5, fromOP=self.ownerComp)
                 return
             self._restore_batch_settings()
-            n_ok = sum(1 for r in self.BatchResults if r[2])
-            self._status(f'Batch finished: {n_ok}/{len(self.BatchResults)} rendered. Last: {message}')
+            n_ok, n = sum(1 for r in self.BatchResults if r[2]), len(self.BatchResults)
+            self._status(f'Batch finished: all {n} rendered' if n_ok == n
+                         else f'Batch finished: {n_ok}/{n} rendered. Last: {message}')
         self._set('Rendering', False)
         self.Refresh(update_status=False)
 
@@ -1191,13 +1332,17 @@ class LtcGenExt:
             return
         rows = list(self._rows())
         s = plan.summary()
-        rows.append({'settings': self._snapshot(), 'file': name + '.mov',
+        out = cfg['output']
+        codec = {'movie': CODECS[cfg['codec']][0], 'moviewav': CODECS[cfg['codec']][0] + ' + WAV',
+                 'wav': 'WAV'}[out]
+        file = name + ('.wav' if out == 'wav' else '.mov')
+        rows.append({'settings': self._snapshot(), 'file': file,
                      'rate': plan.rate.key + (' DF' if plan.drop_frame else ''),
                      'start': s['start'], 'duration': self.pars.Duration.eval(),
-                     'preroll': self.pars.Preroll.eval(), 'codec': CODECS[cfg['codec']][0],
-                     'size': f"{cfg['w']}x{cfg['h']}", 'status': 'queued'})
+                     'preroll': self.pars.Preroll.eval(), 'codec': codec,
+                     'size': '' if out == 'wav' else f"{cfg['w']}x{cfg['h']}", 'status': 'queued'})
         self._store_rows(rows)
-        self._status(f'Added to batch ({len(rows)} rows): {name}.mov')
+        self._status(f'Added to batch ({len(rows)} rows): {file}')
 
     def BatchRemove(self):
         rows = list(self._rows())
@@ -1277,6 +1422,28 @@ class LtcGenExt:
         lines += ['', 'Install folder:', f'  {dest}', '',
                   'Manual install (Terminal, or cmd / PowerShell):', f'  {cmd}']
         return '\n'.join(lines), cmd, info is not None
+
+    @property
+    def RevealLabel(self):
+        """Label of the button that shows the last finished file."""
+        return ('Show in Explorer' if os.name == 'nt'
+                else 'Show in Finder' if sys.platform == 'darwin' else 'Show in folder')
+
+    def ShowInFinder(self):
+        """Show the last finished file in Finder / Explorer."""
+        path = self.pars.Lastfile.eval() if hasattr(self.pars, 'Lastfile') else ''
+        if not path or not os.path.exists(path):
+            self._status('The last file is no longer there')
+            return
+        try:
+            if sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', path])
+            elif os.name == 'nt':
+                subprocess.Popen(['explorer', f'/select,{os.path.normpath(path)}'])
+            else:
+                subprocess.Popen(['xdg-open', os.path.dirname(path)])
+        except OSError as exc:
+            self._status(f'Cannot show the file: {exc}')
 
     def ShowSettings(self):
         """Open the More settings window (Picture, Audio and Setup pages)."""

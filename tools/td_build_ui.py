@@ -58,6 +58,7 @@ FORM = [
     ('fieldString', 'duration', 'DURATION', 'Duration'),
     ('fieldString', 'preroll', 'PRE-ROLL', 'Preroll'),
     ('gap',),
+    ('dropDownMenu', 'filetype', 'FILE TYPE', 'Output'),
     ('dropDownMenu', 'codec', 'CODEC', 'Codec'),
     ('dropDownMenu', 'engine', 'ENGINE', 'Engine'),
     ('dropDownMenu', 'size', 'SIZE', 'Resolution'),
@@ -72,11 +73,13 @@ FORM = [
 
 #: Toggle parameters, so the expressions return True/False.
 DISPLAY = {'customsize': "parent.LtcGen.par.Resolution.eval() == 'custom'"}
-ENABLE = {'dropframe': "parent.LtcGen.par.Rate.eval() in ('29.97', '59.94')"}
+_MOVIE = "parent.LtcGen.par.Output.eval() != 'wav'"           # video settings apply
+ENABLE = {'dropframe': "parent.LtcGen.par.Rate.eval() in ('29.97', '59.94')",
+          'codec': _MOVIE, 'engine': _MOVIE, 'size': _MOVIE, 'customsize': _MOVIE}
 
 #: Settings that need no control: read-only state and the pulses behind the
 #: panel's buttons.
-NOT_EDITABLE = {'Summary', 'Estimate', 'Outputfile', 'Progress', 'Status', 'Rendering', 'Render', 'Cancel',
+NOT_EDITABLE = {'Summary', 'Estimate', 'Outputfile', 'Lastfile', 'Progress', 'Status', 'Rendering', 'Render', 'Cancel',
                 'Batchadd', 'Batchremove', 'Batchclear', 'Batchrender', 'Batchcount'}
 
 STATUS_COLOUR = ("(0.95, 0.45, 0.4) if parent.LtcGen.par.Status.eval().startswith(('Cannot', 'Failed', 'Check')) "
@@ -458,11 +461,23 @@ def _layout(comp, body, form_h):
     _text(right, 'ui_output', 2, 20, SIZE_TEXT, TEXT_DIM, text_expr='parent.LtcGen.par.Outputfile.eval()')
     spacer = right.op('ui_spacer') or _container(right, 'ui_spacer', 10, 10)
     spacer.par.hmode, spacer.par.vmode, spacer.par.alignorder = 'fill', 'fill', 2.5
-    status = _text(right, 'ui_status', 3, 20, SIZE_TEXT, TEXT,
+    # status line, with "Show in Finder" at its end once a file is finished
+    if right.op('ui_status') is not None:
+        right.op('ui_status').destroy()
+    row = right.op('ui_statusrow') or _container(right, 'ui_statusrow', 10, 26, align='horizlr')
+    row.par.hmode, row.par.vmode, row.par.alignorder = 'fill', 'fixed', 3
+    row.par.spacing = 8
+    status = _text(row, 'ui_status', 0, 26, SIZE_TEXT, TEXT,
                    text_expr="parent.LtcGen.par.Status.eval() + ('   \u00b7   ' + parent.LtcGen.par.Estimate.eval() "
                              "if parent.LtcGen.par.Status.eval() == 'Ready' else '')")
+    status.par.vmode = 'fill'
     for k, ch in enumerate('rgb'):
         getattr(status.par, 'fontcolor' + ch).expr = f'({STATUS_COLOUR})[{k}]'
+    reveal = _widget_button(row, 'btn_reveal', 'Show in Finder', 1, 150, FIELD_HOVER,
+                            'parent.LtcGen.ext.LtcGenExt.ShowInFinder()')
+    reveal.par.Buttonofflabel.expr = reveal.par.Buttononlabel.expr = 'parent.LtcGen.ext.LtcGenExt.RevealLabel'
+    reveal.par.display.expr = ("parent.LtcGen.par.Lastfile.eval() != '' "
+                               "and not parent.LtcGen.par.Rendering.eval()")
     prog = right.op('ui_progress')
     prog.par.alignorder = 4
     prog.par.h = 6
@@ -485,12 +500,28 @@ def _ensure_readonly(comp, name, after):
         page.sort(*names)
 
 
+def _ensure_output_menu(comp):
+    """File type: Movie, Movie + WAV or WAV only (Job page, after Overwrite)."""
+    if not hasattr(comp.par, 'Output'):
+        page = next(p for p in comp.customPages if p.name == 'Job')
+        par = page.appendMenu('Output', label='File Type')[0]
+        par.menuNames = ['movie', 'moviewav', 'wav']
+        par.menuLabels = ['Movie', 'Movie + WAV', 'WAV only']
+        par.default = par.val = 'movie'
+        names = [p.name for p in page.pars]
+        names.remove('Output')
+        names.insert(names.index('Overwrite') + 1, 'Output')
+        page.sort(*names)
+
+
 def build_ui(comp_path='/project1/LTCfileGen'):
     comp = op(comp_path)
     if comp.par.Rendering.eval():
         raise RuntimeError('wait for the render to finish')
     _ensure_readonly(comp, 'Estimate', 'Summary')       # render time and engine
     _ensure_readonly(comp, 'Outputfile', 'Estimate')    # the file a render writes
+    _ensure_readonly(comp, 'Lastfile', 'Outputfile')    # last finished file (Show in Finder)
+    _ensure_output_menu(comp)
     body = comp.op('ui_body')
     _build_settings(comp, body)
     form, bound, form_h = _build_form(comp, body)

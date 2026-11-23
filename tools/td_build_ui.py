@@ -41,7 +41,8 @@ GREEN = (0.2, 0.62, 0.32)
 TRACK = (0.17, 0.17, 0.19)
 FIELD = (0.19, 0.19, 0.21)
 FIELD_HOVER = (0.25, 0.25, 0.28)
-MENU_BG = (0.15, 0.15, 0.17)
+MENU_BG = (0.30, 0.30, 0.33)          # pop-up lists: lighter than fields, so they stand apart
+MENU_HOVER = (0.22, 0.38, 0.6)
 ACCENT = (0.2, 0.44, 0.7)
 ICON_FONT = 'Material Design Icons'      # the folder field's browse icon
 SETTINGS_PAGES = ('Picture', 'Audio', 'Setup')
@@ -58,7 +59,7 @@ FORM = [
     ('fieldString', 'duration', 'DURATION', 'Duration'),
     ('fieldString', 'preroll', 'PRE-ROLL', 'Preroll'),
     ('gap',),
-    ('dropDownMenu', 'filetype', 'FILE TYPE', 'Output'),
+    ('dropDownMenu', 'output', 'OUTPUT', 'Output'),
     ('dropDownMenu', 'codec', 'CODEC', 'Codec'),
     ('dropDownMenu', 'engine', 'ENGINE', 'Engine'),
     ('dropDownMenu', 'size', 'SIZE', 'Resolution'),
@@ -175,8 +176,9 @@ def _style_widget(w, kind):
     _set_rgb(w, 'Menufontoffcolor', TEXT)
     _set_rgb(w, 'Menufontoncolor', (1, 1, 1))
     _set_rgb(w, 'Menubgcolor', MENU_BG)
-    _set_rgb(w, 'Menurollcolor', FIELD_HOVER)
+    _set_rgb(w, 'Menurollcolor', MENU_HOVER)
     _set_rgb(w, 'Menuselectcolor', ACCENT)
+    _set(w, 'Menuitemverticalpadding', 7)
     # buttons and toggles: field colour when off, accent when on
     _set_rgb(w, 'Buttonofffacecolor', FIELD)
     _set_rgb(w, 'Buttonofffontcolor', (0.82, 0.82, 0.84))
@@ -501,10 +503,10 @@ def _ensure_readonly(comp, name, after):
 
 
 def _ensure_output_menu(comp):
-    """File type: Movie, Movie + WAV or WAV only (Job page, after Overwrite)."""
+    """Output: Movie, Movie + WAV or WAV only (Job page, after Overwrite)."""
     if not hasattr(comp.par, 'Output'):
         page = next(p for p in comp.customPages if p.name == 'Job')
-        par = page.appendMenu('Output', label='File Type')[0]
+        par = page.appendMenu('Output')[0]
         par.menuNames = ['movie', 'moviewav', 'wav']
         par.menuLabels = ['Movie', 'Movie + WAV', 'WAV only']
         par.default = par.val = 'movie'
@@ -512,6 +514,7 @@ def _ensure_output_menu(comp):
         names.remove('Output')
         names.insert(names.index('Overwrite') + 1, 'Output')
         page.sort(*names)
+    comp.par.Output.label = 'Output'
 
 
 def build_ui(comp_path='/project1/LTCfileGen'):

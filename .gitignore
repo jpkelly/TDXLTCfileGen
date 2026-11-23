@@ -8,12 +8,10 @@ __pycache__/
 .DS_Store
 .vscode/
 
-# TouchDesigner: backups, numbered incremental saves, crash saves, logs
+# TouchDesigner: the repo ships the component (td/LTCfileGen.tox), never a
+# project file (.toe files hold local paths and device names); backups, logs
 Backup/
-*.[0-9].toe
-*.[0-9][0-9].toe
-*.[0-9][0-9][0-9].toe
-CrashAutoSave*.toe
+*.toe
 logs/
 
 # Not part of this project / not ours to redistribute

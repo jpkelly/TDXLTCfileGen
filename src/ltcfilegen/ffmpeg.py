@@ -1,7 +1,9 @@
 """Find, validate, install and run ffmpeg.
 
 TouchDesigner's movie writer records frame-exact video only, so the LTC
-audio is added afterwards with ffmpeg (stream copy, no re-encode).
+audio is added afterwards with ffmpeg (stream copy, no re-encode). The fast
+engine instead pipes frames made in Python straight into an ffmpeg encoder
+(:func:`encode_command`).
 
 Discovery follows the approach of vCon (same author), with these additions:
 
@@ -251,8 +253,8 @@ def find_ffprobe(ffmpeg_path: str | None) -> str | None:
 # Install (imageio-ffmpeg into this tool's user folder, no admin rights)
 
 
-def python_for_pip() -> str | None:
-    """A Python that can run pip, preferring TouchDesigner's own.
+def _python_candidates() -> list[str]:
+    """Python interpreters to try, TouchDesigner's own first.
 
     Inside TouchDesigner ``sys.executable`` is TouchDesigner itself, so the
     interpreter is located explicitly.
@@ -269,13 +271,22 @@ def python_for_pip() -> str | None:
         found = shutil.which(name)
         if found:
             cands.append(found)
-    for cand in cands:
-        if cand and os.path.isfile(cand):
-            try:
-                if _run([cand, "-m", "pip", "--version"], 30).returncode == 0:
-                    return cand
-            except Exception:
-                continue
+    seen, out = set(), []
+    for c in cands:
+        if c and os.path.isfile(c) and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def python_for_pip() -> str | None:
+    """A Python that can run pip, preferring TouchDesigner's own."""
+    for cand in _python_candidates():
+        try:
+            if _run([cand, "-m", "pip", "--version"], 30).returncode == 0:
+                return cand
+        except Exception:
+            continue
     return None
 
 
@@ -405,3 +416,131 @@ def mux_command(ffmpeg: str, video: str, pcm: dict, out: str,
         cmd += ["-progress", progress_path]
     cmd.append(out)
     return cmd
+
+
+# ----------------------------------------------------------------------
+# Fast engine: ffmpeg encodes frames generated in Python (ltcfilegen.picture)
+# and adds the LTC in the same pass. NotchLC has no ffmpeg encoder.
+
+#: Colour tags TouchDesigner's Movie File Out writes (sRGB output, BT.709).
+#: Set on the frames (setparams), since output options lose to frame tags.
+COLOUR_TAGS = "setparams=color_primaries=bt709:color_trc=iec61966-2-1:colorspace=bt709"
+
+
+@dataclass(frozen=True)
+class FastEncoder:
+    """An ffmpeg encoder setup matching one of the component's codecs."""
+
+    name: str                 # ffmpeg encoder
+    args: tuple               # encoder options
+    pix_fmt: str              # pixel format handed to the encoder
+    yuv: bool                 # converted to limited-range BT.709 YUV
+
+
+_H26X_RATE = ("-maxrate", "10M", "-bufsize", "20M", "-g", "15")   # TD: 10 Mb/s peak, keyframe every 15
+
+#: Candidates per codec, best first. Settings follow what Movie File Out
+#: writes (HAP in 12 chunks, ProRes 4:2:2 10-bit, H.264/H.265 4:2:0 with a
+#: keyframe every 15 frames, hvc1 tag). Quality-based rate control with a
+#: peak cap keeps mostly-black timecode files small.
+FAST_ENCODERS: dict[str, tuple[FastEncoder, ...]] = {
+    "hap": (FastEncoder("hap", ("-format", "hap", "-chunks", "12", "-compressor", "snappy"), "rgba", False),),
+    "hapq": (FastEncoder("hap", ("-format", "hap_q", "-chunks", "12", "-compressor", "snappy"), "rgba", False),),
+    "prores422hq": (FastEncoder("prores_videotoolbox", ("-profile:v", "hq"), "p210le", True),
+                    FastEncoder("prores_ks", ("-profile:v", "3", "-vendor", "apl0"), "yuv422p10le", True)),
+    "prores422": (FastEncoder("prores_videotoolbox", ("-profile:v", "standard"), "p210le", True),
+                  FastEncoder("prores_ks", ("-profile:v", "2", "-vendor", "apl0"), "yuv422p10le", True)),
+    "h264": (FastEncoder("libx264", ("-preset", "fast", "-profile:v", "high", "-crf", "18") + _H26X_RATE,
+                         "yuv420p", True),
+             FastEncoder("h264_videotoolbox", ("-profile:v", "high", "-b:v", "8M") + _H26X_RATE,
+                         "yuv420p", True)),
+    # VideoToolbox first: about twice as fast as x265 here (M4 Max).
+    "h265": (FastEncoder("hevc_videotoolbox", ("-b:v", "8M", "-tag:v", "hvc1") + _H26X_RATE,
+                         "yuv420p", True),
+             FastEncoder("libx265", ("-preset", "fast", "-crf", "20", "-tag:v", "hvc1",
+                                     "-x265-params", "log-level=error") + _H26X_RATE, "yuv420p", True)),
+}
+
+_encoder_cache: dict[tuple, object] = {}
+
+
+def _file_key(path: str) -> tuple:
+    st = os.stat(path)
+    return (os.path.abspath(path), st.st_mtime, st.st_size)
+
+
+def encoders(ffmpeg: str, timeout: float = 10.0) -> set[str]:
+    """Names of the encoders this ffmpeg lists. Cached per file."""
+    key = ("list",) + _file_key(ffmpeg)
+    if key not in _encoder_cache:
+        out = _run([ffmpeg, "-hide_banner", "-encoders"], timeout).stdout.decode("utf-8", "replace")
+        _encoder_cache[key] = {tok for line in out.splitlines() for tok in line.split()[1:2]}
+    return _encoder_cache[key]  # type: ignore[return-value]
+
+
+def encoder_works(ffmpeg: str, enc: FastEncoder, timeout: float = 20.0) -> bool:
+    """Encode three tiny frames: a listed encoder may still fail to open
+    (hardware encoders, missing libraries). Cached per file and encoder."""
+    key = ("works", enc) + _file_key(ffmpeg)
+    if key not in _encoder_cache:
+        cmd = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error",
+               "-f", "lavfi", "-i", "color=c=gray:s=64x64:r=25", "-frames:v", "3",
+               "-c:v", enc.name, *enc.args, "-pix_fmt", enc.pix_fmt, "-f", "null", "-"]
+        try:
+            ok = _run(cmd, timeout).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        _encoder_cache[key] = ok
+    return bool(_encoder_cache[key])
+
+
+def fast_encoder(ffmpeg: str, codec: str) -> FastEncoder | None:
+    """The first working fast-engine encoder for a component codec key."""
+    listed = encoders(ffmpeg)
+    for enc in FAST_ENCODERS.get(codec, ()):
+        if enc.name in listed and encoder_works(ffmpeg, enc):
+            return enc
+    return None
+
+
+def encode_command(ffmpeg: str, enc: FastEncoder, w: int, h: int, gray: bool, rate: Fraction,
+                   pcm: dict, out: str, timecode: str | None = None) -> list[str]:
+    """Encode raw frames from stdin (8-bit gray or RGB, top row first, full
+    range) and add the PCM LTC track in one pass."""
+    acodec = {"s16le": "pcm_s16le", "s24le": "pcm_s24le"}[pcm["format"]]
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y",
+           "-f", "rawvideo", "-pix_fmt", "gray" if gray else "rgb24", "-color_range", "pc",
+           "-s", f"{w}x{h}", "-framerate", f"{rate.numerator}/{rate.denominator}", "-i", "pipe:0",
+           "-f", pcm["format"], "-ar", str(pcm["sample_rate"]), "-ac", str(pcm["channels"]),
+           "-i", pcm["path"],
+           "-map", "0:v:0", "-map", "1:a:0"]
+    if enc.yuv:
+        # accurate_rnd: without it gray input gives V=127 for white (BT.709 wants 128).
+        vf = f"scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,{COLOUR_TAGS}:range=tv"
+    else:
+        vf = f"format={enc.pix_fmt},{COLOUR_TAGS}"
+    cmd += ["-vf", vf, "-c:v", enc.name, *enc.args, "-pix_fmt", enc.pix_fmt,
+            "-c:a", acodec, "-metadata:s:a:0", "title=LTC", "-metadata:s:a:0", "handler_name=LTC"]
+    if timecode:
+        cmd += ["-timecode", timecode]
+    cmd.append(out)
+    return cmd
+
+
+_python_cache: dict[str, str | None] = {}
+
+
+def python_for_worker() -> str | None:
+    """A Python that can import numpy, to run the fast worker outside
+    TouchDesigner (TouchDesigner's own interpreter first). Cached."""
+    if "py" not in _python_cache:
+        found = None
+        for cand in _python_candidates():
+            try:
+                if _run([cand, "-c", "import numpy"], 30).returncode == 0:
+                    found = cand
+                    break
+            except Exception:
+                continue
+        _python_cache["py"] = found
+    return _python_cache["py"]

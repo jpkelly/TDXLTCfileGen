@@ -5,15 +5,32 @@ the background ffmpeg mux and the read-back check. All timecode, LTC and
 ffmpeg logic lives in the plain-Python engine in ../src/ltcfilegen, which is
 tested outside TouchDesigner.
 
+Two engines (Video page, Engine):
+  TouchDesigner  Movie File Out writes one frame per TouchDesigner frame
+                 (NotchLC needs this; the loop follows the display refresh)
+  ffmpeg fast    TouchDesigner renders each text line once per digit; a
+                 separate process (ltcfilegen.fastrender) assembles every
+                 frame with numpy and pipes it into ffmpeg, which also adds
+                 the LTC. Several times faster. Auto uses it when it can,
+                 after checking its frames against TouchDesigner's, and falls
+                 back to TouchDesigner if it fails.
+
 Render loop (one step per cooked frame, from the frame-start Execute DAT):
-  arm     record=1, pause=1, let Movie File Out open the file
-  record  frame i: set picture, append LTC samples, pulse Add Frame
-  close   record=0, wait until Movie File Out reports the file complete
-  mux     ffmpeg copies the video and adds the LTC track (background)
-  verify  read the finished file back; fail loudly on any mismatch
+  TouchDesigner engine:
+    arm     record=1, pause=1, let Movie File Out open the file
+    record  frame i: set picture, append LTC samples, pulse Add Frame
+    close   record=0, wait until Movie File Out reports the file complete
+    mux     ffmpeg copies the video and adds the LTC track (background)
+  ffmpeg fast engine:
+    fast    follow the worker's status file until it exits
+  both:
+    verify  read the finished file back; fail loudly on any mismatch
 """
 
+import dataclasses
 import importlib
+import json
+import numpy as np
 import os
 from fractions import Fraction
 import re
@@ -36,9 +53,17 @@ RESOLUTIONS = {'3840x2160': (3840, 2160), '2560x1440': (2560, 1440),
                '1920x1080': (1920, 1080), '1280x720': (1280, 720)}
 
 #: Conservative render-speed estimate: one frame per TouchDesigner loop, and
-#: the loop follows the display refresh (about 118/s on a 120 Hz MacBook Pro
-#: display, about 60/s on a 60 Hz display).
+#: the loop follows the display refresh (measured about 118/s on a 120 Hz
+#: MacBook Pro display; presumably about 60/s on a 60 Hz display, untested).
 EST_FRAMES_PER_SECOND = 60.0
+
+#: Conservative ffmpeg fast-engine speeds at 1920x1080 (frames/s, every
+#: picture option on, M4 Max), scaled by pixel count for other sizes.
+FAST_EST_FPS = {'hap': 500, 'hapq': 400, 'prores422hq': 400, 'prores422': 400,
+                'h264': 400, 'h265': 150}
+
+#: Text TOP of each text line the picture can show (see ltcfilegen.picture).
+LINE_TOPS = {'main': 'text_main', 'sub': 'text_sub', 'count': 'text_count'}
 
 FINALIZE_TIMEOUT = 600          # s to wait for Movie File Out after record=0
 
@@ -82,11 +107,16 @@ class LtcGenExt:
         import ltcfilegen.job
         import ltcfilegen.ltc
         import ltcfilegen.ffmpeg
+        import ltcfilegen.picture
         # Reload in dependency order so edits on disk take effect on re-init.
-        for m in (ltcfilegen.timecode, ltcfilegen.job, ltcfilegen.ltc, ltcfilegen.ffmpeg):
+        for m in (ltcfilegen.timecode, ltcfilegen.job, ltcfilegen.ltc, ltcfilegen.ffmpeg,
+                  ltcfilegen.picture):
             importlib.reload(m)
         self.tc, self.jobs, self.ltc, self.ff = (ltcfilegen.timecode, ltcfilegen.job,
                                                  ltcfilegen.ltc, ltcfilegen.ffmpeg)
+        self.pic = ltcfilegen.picture
+        self._layouts = {}
+        self._anchors = {}
         self.job = None
         self.batch = []
         self.BatchResults = []
@@ -127,18 +157,18 @@ class LtcGenExt:
             mvo.par.pause = 0
         if stale.get('orig_cook'):
             project.cookRate = stale['orig_cook']
-        pid = stale.get('pid')
-        if pid:
-            try:
-                name = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], capture_output=True,
-                                      text=True, timeout=5).stdout if os.name != 'nt' else ''
-                if 'ffmpeg' in name:
+        # The ffmpeg mux, or the fast worker and its ffmpeg. A pid may have
+        # been reused since, so only stop processes that are still ours.
+        for pid in [stale.get('pid')] + list(stale.get('pids') or []):
+            if pid and self._is_our_process(pid):
+                try:
                     os.kill(pid, 15)
-            except Exception:
-                pass
+                except OSError:
+                    pass
         stem = stale['stem']
-        self.cleanup = [stale['video'], stale['pcm'], stem + '.muxing.mov',
-                        stem + '.mux.progress', stem + '.mux.log']
+        self.cleanup = [f for f in [stale.get('video'), stale.get('pcm'), stem + '.muxing.mov',
+                                    stem + '.mux.progress', stem + '.mux.log']
+                        + list(stale.get('temp') or []) if f]
         self._cleanup_t0 = time.time()
         self.ownerComp.unstore('active_job')
         return True
@@ -246,11 +276,18 @@ class LtcGenExt:
             return
         self.plan, self.audio, self.cfg = plan, audio, cfg
         secs = plan.video_frames / float(plan.rate.fps)
-        est = plan.video_frames / EST_FRAMES_PER_SECOND
+        pref = self.pars.Engine.eval() if hasattr(self.pars, 'Engine') else 'auto'
+        if pref != 'td' and cfg['codec'] in FAST_EST_FPS and self.ffinfo is not None:
+            how = 'ffmpeg fast'
+            est = plan.video_frames / (FAST_EST_FPS[cfg['codec']] * 1920 * 1080 / (cfg['w'] * cfg['h']))
+        else:
+            how = 'TouchDesigner'
+            est = plan.video_frames / EST_FRAMES_PER_SECOND
+        when = 'under a minute' if est < 60 else f'about {round(est / 60)} min'
         s = plan.summary()
         self._set('Summary', f"{s['first']} to {s['end']}  |  {plan.video_frames:,} frames  |  "
                              f"{int(secs // 3600)}:{int(secs % 3600 // 60):02d}:{secs % 60:05.2f}  |  "
-                             f"render about {max(1, round(est / 60))} min")
+                             f"render {when} ({how})")
         self.ApplySettings(cfg)
         self.ApplyFrame(0, plan, cfg, preview=True)
         if update_status:
@@ -280,6 +317,16 @@ class LtcGenExt:
             t.par.positionx, t.par.positiony = px, py
             t.par.bgalpha = 0
         self.child('text_info').par.text = cfg['info_text'] if cfg['info'] else ''
+        # Readout lines are drawn from fixed character positions (Specification
+        # DAT), so digits never shift sideways; see ltcfilegen.picture.LineLayout.
+        self._layouts = {}
+        self._anchors = {}
+        for line, top in LINE_TOPS.items():
+            t = self.child(top)
+            t.par.text = ''
+            t.par.specdat = 'spec_' + line
+            _, _, _, px, py = texts[top]
+            self._anchors[line] = (w / 2.0 + px, h / 2.0 + py)
         g = self.child('glsl_picture')
         g.par.outputresolution = 'custom'
         g.par.resolutionw, g.par.resolutionh = w, h
@@ -296,27 +343,113 @@ class LtcGenExt:
         cfg = cfg or self.cfg
         if plan is None or cfg is None:
             return
-        ltc_text, video_text = plan.ltc_text(i), plan.video_text(i)
-        high = plan.div == 2
-        main_is_video = high and cfg['main'] == 'video'
-        main = video_text if main_is_video else ltc_text
-        sub = ''
-        if high and cfg['secondary']:
-            sub = f'LTC {ltc_text}' if main_is_video else f'VIDEO {video_text}'
-        count = f'-{plan.remaining_text(i)}' if cfg['countdown'] else ''
-        for name, text in (('text_main', main), ('text_sub', sub), ('text_count', count)):
-            t = self.child(name)
-            if t.par.text.eval() != text:
-                t.par.text = text
-        vlabel = plan.video_label(i)
-        flash = cfg['flash'] and vlabel[3] == 0 and not preview
+        texts, flash, slot = self.pic.frame_state(plan, cfg, i, preview=preview)
+        for line, text in texts.items():
+            self._set_line(line, text)
         bg, fg = (cfg['fg'], cfg['bg']) if flash else (cfg['bg'], cfg['fg'])
         g = self.child('glsl_picture')
         g.par.vec0valuex, g.par.vec0valuey, g.par.vec0valuez = bg
         g.par.vec1valuex, g.par.vec1valuey, g.par.vec1valuez = fg
         g.par.vec2valuey = i
-        g.par.vec3valuey = vlabel[3]
+        g.par.vec3valuey = slot
         g.par.vec3valuez = plan.rate.nominal
+
+    def _line_layout(self, line, tmpl):
+        """Fixed character positions for a line, from its Text TOP's font."""
+        t = self.child(LINE_TOPS[line])
+        cx, cy = self._anchors.get(line, (t.width / 2.0, t.height / 2.0))
+        # Same vertical place as the Text TOP's own centring (metrics mode),
+        # measured on 2025.33230: baseline = centre - height/2 + descender/2.
+        height = t.evalTextSize('0')[1]
+        baseline = cy - height / 2.0 + t.fontDescender / 2.0
+        return self.pic.LineLayout(tmpl, lambda s: t.evalTextSize(s)[0], cx, baseline)
+
+    def _set_line(self, line, text):
+        """Show text on a line, rewriting only the table cells that change."""
+        spec = self.child('spec_' + line)
+        tmpl = self.pic.template(text)
+        layout, old = self._layouts.get(line, (None, None))
+        if old is None or (layout.template if layout else '') != tmpl:
+            layout = self._line_layout(line, tmpl) if text else None
+            rows = layout.rows(text) if layout else []
+            spec.clear()
+            spec.appendRow(['x', 'y', 'text'])
+            for r in rows:
+                spec.appendRow(list(r))
+            self._layouts[line] = (layout, rows)
+            return
+        if layout is None:
+            return
+        rows = layout.rows(text)
+        for k, (new, prev) in enumerate(zip(rows, old)):
+            if new != prev:
+                spec[k + 1, 0] = new[0]
+                spec[k + 1, 2] = new[2]
+        self._layouts[line] = (layout, rows)
+
+    # ------------------------------------------------------------------
+    # Fast engine, picture side: TouchDesigner renders each text line once
+    # per digit; numpy assembles the frames (ltcfilegen.picture).
+
+    def _alpha(self, top, cfg):
+        """A Text TOP's alpha as uint8, top row first."""
+        t = self.child(top)
+        t.cook(force=True)
+        a = t.numpyArray(delayed=False)
+        if a is None or a.shape[:2] != (cfg['h'], cfg['w']):
+            got = 'nothing' if a is None else f'{a.shape[1]}x{a.shape[0]}'
+            raise self.pic.PictureError(f'TouchDesigner drew the text at {got}, not '
+                                        f"{cfg['w']}x{cfg['h']} (licence size limit?)")
+        return np.ascontiguousarray(np.flipud(np.floor(a[:, :, 3] * 255 + 0.5)).astype(np.uint8))
+
+    def _picture(self, cfg):
+        """The finished picture (null_out) as uint8 RGB, top row first."""
+        n = self.child('null_out')
+        n.cook(force=True)
+        a = n.numpyArray(delayed=False)
+        return np.ascontiguousarray(np.flipud(np.floor(a[:, :, :3] * 255 + 0.5)).astype(np.uint8))
+
+    def FastGlyphs(self, plan, cfg):
+        """Glyph cells for the fast engine, checked against TouchDesigner.
+
+        Renders each line with every digit 0..9, then compares assembled lines
+        (mixed digits) and whole frames with TouchDesigner's own pictures.
+        Returns (layers, info). Raises PictureError on any difference."""
+        pic = self.pic
+        cfg = dict(cfg, slots=plan.rate.nominal)
+        self.ApplySettings(cfg)
+        texts, _, _ = pic.frame_state(plan, cfg, 0)
+        layers = {}
+        for line, top in LINE_TOPS.items():
+            layers[line] = None
+            if not texts[line]:
+                self._set_line(line, '')
+                continue
+            tmpl = pic.template(texts[line])
+            refs = []
+            for d in range(10):
+                self._set_line(line, pic.with_digit(tmpl, d))
+                refs.append(self._alpha(top, cfg))
+            layer = pic.TextLayer.from_refs(tmpl, refs)
+            if layer is not None:
+                for s in pic.check_strings(tmpl):
+                    self._set_line(line, s)
+                    if not np.array_equal(self._alpha(top, cfg), layer.render(s, cfg['h'], cfg['w'])):
+                        raise pic.PictureError(f'the {line} line ({s}) does not assemble exactly '
+                                               f'from single digits in this font')
+            layers[line] = layer
+        info = self._alpha('text_info', cfg) if cfg['info'] else None
+        for i in pic.check_frames(plan, cfg):
+            self.ApplyFrame(i, plan, cfg)
+            want = self._picture(cfg)
+            texts, flash, slot = pic.frame_state(plan, cfg, i)
+            got = pic.Compositor(cfg, layers, info).frame(i, texts, flash, slot)
+            if got.ndim == 2:
+                got = np.repeat(got[:, :, None], 3, axis=2)
+            diff = int(np.abs(want.astype(np.int16) - got).max())
+            if diff > 1:
+                raise pic.PictureError(f'frame {i} differs from TouchDesigner by up to {diff}/255')
+        return layers, info
 
     # ------------------------------------------------------------------
     # ffmpeg
@@ -338,6 +471,8 @@ class LtcGenExt:
             why = '; '.join(f'{t.path or t.source}: {t.reason}' for t in tried[:3]) or 'none found'
             self._set('Ffmpegstatus', f'Not found ({why}). Pulse Install ffmpeg.')
             self._set('Ffmpegready', False)
+        if not self.job and self.plan is not None:
+            self.Refresh(update_status=False)     # the estimate depends on the engine
         return info
 
     def InstallFfmpeg(self):
@@ -426,6 +561,99 @@ class LtcGenExt:
                 return
             self.InstallFfmpeg()
 
+        pref = self.pars.Engine.eval() if hasattr(self.pars, 'Engine') else 'auto'
+        engine, why = self._pick_engine(pref, cfg)
+        if engine == 'fast':
+            try:
+                self._start_fast(plan, audio, cfg, stem, final, auto=(pref == 'auto'))
+                return
+            except Exception as exc:
+                why = f'{exc}'
+                self.job = None
+                self.ApplyFrame(0, plan, cfg, preview=True)
+        if pref == 'ffmpeg':
+            self._status(f'Cannot render with ffmpeg fast: {why}')
+            return
+        self._start_td(plan, audio, cfg, stem, final, note=why if pref == 'auto' else None)
+
+    def _pick_engine(self, pref, cfg):
+        """('fast', None) when the ffmpeg fast engine can make this codec,
+        else ('td', reason). Probes are cached, so this is quick after the
+        first time."""
+        if pref == 'td':
+            return 'td', None
+        label = CODECS[cfg['codec']][0]
+        if cfg['codec'] not in self.ff.FAST_ENCODERS:
+            return 'td', f'{label} has no ffmpeg encoder'
+        if self.ffinfo is None:
+            return 'td', 'ffmpeg is not installed yet'
+        enc = self.ff.fast_encoder(self.ffinfo.path, cfg['codec'])
+        if enc is None:
+            return 'td', f'this ffmpeg ({self.ffinfo.source or self.ffinfo.path}) cannot encode {label}'
+        py = self.ff.python_for_worker()
+        if py is None:
+            return 'td', 'no Python with numpy was found to run it'
+        self._fast_tools = (enc, py)
+        return 'fast', None
+
+    def _start_fast(self, plan, audio, cfg, stem, final, auto):
+        """Start the ffmpeg fast engine: glyphs from TouchDesigner, frames and
+        encode in a separate process (ltcfilegen.fastrender)."""
+        enc, py = self._fast_tools
+        layers, info = self.FastGlyphs(plan, cfg)
+        self.ApplyFrame(0, plan, cfg, preview=True)
+        paths = {k: stem + suffix for k, suffix in (
+            ('glyphs', '.glyphs.npz'), ('job', '.fast.json'), ('status', '.fast.status'),
+            ('log', '.fast.log'), ('out_log', '.fast.out'), ('pcm', '.ltc.pcm'), ('out', '.muxing.mov'))}
+        self._claim(list(paths.values()) + [paths['status'] + '.tmp'])
+        for f in paths.values():
+            if os.path.exists(f):
+                os.remove(f)
+        self.pic.save_layers(paths['glyphs'], layers, info)
+        keys = ('w', 'h', 'fg', 'bg', 'main', 'secondary', 'countdown', 'flash', 'marker',
+                'marker_h', 'barcode', 'strip_h')
+        job = {'spec': dataclasses.asdict(plan.spec), 'audio': dataclasses.asdict(audio),
+               'cfg': {k: cfg[k] for k in keys}, 'glyphs': paths['glyphs'], 'pcm': paths['pcm'],
+               'out': paths['out'], 'status': paths['status'], 'log': paths['log'],
+               'ffmpeg': self.ffinfo.path, 'encoder': dataclasses.asdict(enc),
+               'timecode': plan.embedded_timecode if cfg['tctrack'] else None}
+        with open(paths['job'], 'w') as fh:
+            json.dump(job, fh)
+        src = os.path.join(_engine_root(self.ownerComp), 'src')
+        env = dict(os.environ)
+        env['PYTHONPATH'] = src + (os.pathsep + env['PYTHONPATH'] if env.get('PYTHONPATH') else '')
+        kw = {'creationflags': 0x08000000} if os.name == 'nt' else {}
+        out_log = open(paths['out_log'], 'wb')
+        proc = subprocess.Popen([py, '-m', 'ltcfilegen.fastrender', paths['job']], stdout=out_log,
+                                stderr=out_log, stdin=subprocess.DEVNULL, env=env, cwd=src, **kw)
+        temp = [paths[k] for k in ('glyphs', 'job', 'status', 'log', 'out_log')] + [paths['status'] + '.tmp']
+        self.job = {'state': 'fast', 'engine': 'ffmpeg fast', 'encoder': enc.name, 'i': 0,
+                    'plan': plan, 'cfg': cfg, 'enc': self.ltc.LtcEncoder(plan, audio), 'audio': audio,
+                    'pcm_path': paths['pcm'], 'video': None, 'final': final, 'stem': stem,
+                    't0': time.time(), 'proc': proc, 'log': out_log, 'log_path': paths['out_log'],
+                    'mux_out': paths['out'], 'fast_status': paths['status'], 'temp': temp,
+                    'pids': [proc.pid], 'auto': auto}
+        self._store_active(self.job)
+        self._set('Progress', 0.0)
+        self._set('Rendering', True)
+        self._status(f'Rendering {os.path.basename(final)} (ffmpeg fast, {enc.name})')
+
+    def _claim(self, paths):
+        """A new job owns these files: take them off the queued cleanup of an
+        earlier job with the same name, which would otherwise delete them."""
+        self.cleanup = [f for f in self.cleanup if f not in set(paths)]
+
+    def _store_active(self, j):
+        """Persist what a re-init needs to stop processes and remove files."""
+        self.ownerComp.store('active_job', {
+            'video': j.get('video'), 'pcm': j['pcm_path'], 'stem': j['stem'],
+            'pid': j['proc'].pid if j.get('proc') else None, 'pids': list(j.get('pids', [])),
+            'temp': list(j.get('temp', [])), 'orig_cook': j.get('orig_cook')})
+
+    def _start_td(self, plan, audio, cfg, stem, final, note=None):
+        """Render through Movie File Out, one frame per TouchDesigner frame."""
+        self._claim([stem + x for x in ('.video.partial.mov', '.ltc.pcm', '.muxing.mov',
+                                         '.mux.progress', '.mux.log')])
         enc = self.ltc.LtcEncoder(plan, audio)
         video = stem + '.video.partial.mov'
         pcm_path = stem + '.ltc.pcm'
@@ -447,16 +675,15 @@ class LtcGenExt:
         self.job = {'state': 'arm', 'ticks': 0, 'i': 0, 'plan': plan, 'cfg': cfg, 'enc': enc,
                     'audio': audio, 'pcm': open(pcm_path, 'wb'), 'pcm_path': pcm_path,
                     'video': video, 'final': final, 'stem': stem, 't0': time.time(),
-                    'proc': None, 'log': None}
+                    'proc': None, 'log': None, 'engine': 'TouchDesigner'}
         self._set('Progress', 0.0)
         self.job['orig_cook'] = project.cookRate
-        self.ownerComp.store('active_job', {'video': video, 'pcm': pcm_path, 'stem': stem,
-                                            'orig_cook': project.cookRate})
+        self._store_active(self.job)
         project.cookRate = RENDER_COOK_RATE
         self._set('Rendering', True)
         mvo.par.record = 1
         mvo.par.pause = 1
-        self._status(f'Rendering {os.path.basename(final)}')
+        self._status(f'Rendering {os.path.basename(final)}' + (f' in TouchDesigner ({note})' if note else ''))
 
     def _busy(self):
         """A job is running, or a batch is between jobs."""
@@ -529,6 +756,94 @@ class LtcGenExt:
             getattr(self, '_tick_' + j['state'])(j)
         except Exception as exc:              # never leave Movie File Out recording
             self._end_job(f'Failed: {type(exc).__name__}: {exc}', keep=False)
+
+    def _tick_fast(self, j):
+        """Follow the fast worker; on success go on to the read-back check."""
+        try:
+            with open(j['fast_status']) as fh:
+                st = json.load(fh)
+        except (OSError, ValueError):
+            st = {}
+        ffpid = st.get('ffmpeg_pid')
+        if ffpid and ffpid not in j['pids']:
+            j['pids'].append(ffpid)
+            self._store_active(j)
+        rc = j['proc'].poll()
+        if rc is None:
+            phase = st.get('phase')
+            if phase == 'audio':
+                self._set('Progress', round(0.05 * st.get('fraction', 0.0), 4))
+                self._status('Writing the LTC audio...', log=False)
+            elif phase == 'video' and st.get('total'):
+                fps = st.get('fps') or 0.0
+                left = (st['total'] - st['frame']) / fps if fps else 0.0
+                self._set('Progress', round(0.05 + 0.9 * st.get('fraction', 0.0), 4))
+                self._status(f'Rendering {st["frame"]:,}/{st["total"]:,}  ({fps:.0f} fps, '
+                             f'{int(left // 60)}:{int(left % 60):02d} left, ffmpeg fast)', log=False)
+            elif phase == 'finishing':
+                self._set('Progress', 0.95)
+                self._status('Finishing the file...', log=False)
+            return
+        j['log'].close()
+        if rc == 0 and st.get('phase') == 'done':
+            j['state'] = 'verify'
+            return
+        err = st.get('error') or self._tail(j['log_path']) or f'exit code {rc}'
+        if not j.get('auto'):
+            raise RuntimeError(f'ffmpeg fast render failed: {err}')
+        # Automatic engine: never fail where TouchDesigner would succeed.
+        debug(f'LTC File Gen: ffmpeg fast render failed, using TouchDesigner: {err}')
+        self._kill_pids(j)
+        # The TouchDesigner render reuses the .ltc.pcm and .muxing.mov names,
+        # so remove the fast render's files now rather than queue them.
+        for f in j['temp'] + [j['mux_out'], j['pcm_path']]:
+            try:
+                if f and os.path.exists(f):
+                    os.remove(f)
+            except OSError:
+                self.cleanup.append(f)
+        batch = j.get('batch')
+        self.job = None
+        self._start_td(j['plan'], j['audio'], j['cfg'], j['stem'], j['final'],
+                       note='ffmpeg fast render failed')
+        if batch is not None and self.job:
+            self.job['batch'] = batch
+
+    @staticmethod
+    def _tail(path, n=400):
+        try:
+            with open(path, 'rb') as fh:
+                fh.seek(max(0, os.path.getsize(path) - n))
+                return fh.read().decode('utf-8', 'replace').strip()
+        except OSError:
+            return ''
+
+    @staticmethod
+    def _is_our_process(pid):
+        """True if pid is a running ffmpeg or Python (the mux, the fast worker
+        or its ffmpeg). A pid of an exited process may belong to anything."""
+        try:
+            if os.name == 'nt':
+                name = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'],
+                                      capture_output=True, text=True, timeout=5,
+                                      creationflags=0x08000000).stdout
+            else:
+                name = subprocess.run(['ps', '-p', str(pid), '-o', 'comm='], capture_output=True,
+                                      text=True, timeout=5).stdout
+        except Exception:
+            return False
+        name = name.lower()
+        return 'ffmpeg' in name or 'python' in name
+
+    def _kill_pids(self, j):
+        """Stop the fast worker and its ffmpeg (ffmpeg would otherwise finish
+        a truncated file when its input closes)."""
+        for pid in reversed(j.get('pids', [])):
+            if self._is_our_process(pid):
+                try:
+                    os.kill(pid, 9 if os.name != 'nt' else 15)
+                except (OSError, ValueError):
+                    pass
 
     def _tick_arm(self, j):
         j['ticks'] += 1
@@ -657,6 +972,8 @@ class LtcGenExt:
         secs = time.time() - j['t0']
         note = (f'; timestamps corrected, TouchDesigner wrote {j["retimed"]}'
                 if j.get('retimed') else '')
+        if j.get('engine') == 'ffmpeg fast':
+            note += ', ffmpeg fast'
         self._end_job(f'Done: {os.path.basename(j["final"])}  ({plan.video_frames:,} frames, '
                       f'{int(secs // 60)}:{int(secs % 60):02d}{note})', keep=False, progress=1.0)
 
@@ -674,6 +991,10 @@ class LtcGenExt:
         if j:
             proc = j.get('proc')
             if proc and proc.poll() is None:
+                # Still running (cancel, failure): stop the fast worker's ffmpeg
+                # too. Never signal pids of processes that have exited: the
+                # system may have given them to something else.
+                self._kill_pids(j)
                 proc.kill()
             for fh in (j.get('pcm'), j.get('log')):
                 try:
@@ -681,12 +1002,12 @@ class LtcGenExt:
                         fh.close()
                 except Exception:
                     pass
-            junk = [j.get('mux_out'), j.get('progress'), j.get('log_path')]
+            junk = [j.get('mux_out'), j.get('progress'), j.get('log_path')] + j.get('temp', [])
             if not keep:
                 junk += [j['pcm_path'], j['video']]
             # Movie File Out may still hold the video open: OnFrame deletes
             # these once it reports the file closed.
-            self.cleanup = [f for f in junk if f]
+            self.cleanup = self.cleanup + [f for f in junk if f and f not in self.cleanup]
             self._cleanup_t0 = time.time()
         if progress is not None:
             self._set('Progress', progress)

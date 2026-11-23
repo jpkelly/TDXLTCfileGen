@@ -1,4 +1,4 @@
-// LTC File Gen: composes the timecode picture.
+// LTC File Generator: composes the timecode picture.
 // Inputs (alpha only; all at output resolution):
 //   0 main readout   1 secondary counter   2 countdown   3 info caption
 // Every value that changes per frame arrives as a uniform set by the

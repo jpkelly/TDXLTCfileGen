@@ -24,6 +24,7 @@ import os
 
 WIDGETS = os.path.join(app.samplesFolder, 'Palette', 'UI', 'Basic Widgets')
 LISTER = os.path.join(app.samplesFolder, 'Palette', 'UI', 'lister.tox')
+APP_NAME = 'LTC File Generator'
 
 # ---- design
 FONT = 'Verdana'
@@ -210,7 +211,7 @@ def _build_settings(comp, body):
     moved.par.hmode, moved.par.vmode = 'fill', 'fill'
     win = settings.create(windowCOMP, 'win')
     win.par.winop = panel.name
-    win.par.title = 'LTC File Gen: more settings'
+    win.par.title = f'{APP_NAME}: more settings'
     win.par.size = 'custom'
     win.par.winw, win.par.winh = SETTINGS_SIZE
     win.par.justifyh, win.par.justifyv = 'center', 'center'
@@ -434,6 +435,7 @@ def _layout(comp, body, form_h):
     top.par.spacing = 8
     _rgb(top, 'bgcolor', BAR_BG, 1)
     title = top.op('ui_title')
+    title.par.text = APP_NAME
     title.par.font, title.par.fontsize = FONT, SIZE_TITLE
 
     body.par.vmode = 'fixed'

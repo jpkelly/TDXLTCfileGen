@@ -1,4 +1,4 @@
-"""LTC File Gen: TouchDesigner extension.
+"""LTC File Generator: TouchDesigner extension.
 
 Drives TouchDesigner only: parameters, the picture, stop-frame recording,
 the background ffmpeg mux and the read-back check. All timecode, LTC and
@@ -273,7 +273,7 @@ class LtcGenExt:
     def _status(self, text, log=True):
         self._set('Status', text)
         if log:
-            debug(f'LTC File Gen: {text}')
+            debug(f'LTC File Generator: {text}')
 
     # ------------------------------------------------------------------
     # Settings -> validated job
@@ -646,7 +646,7 @@ class LtcGenExt:
             self._status('Cannot render: ffmpeg not found (click ? for Setup & Help)')
             return
         if ffinfo is None and not self.install:
-            choice = ui.messageBox('LTC File Gen',
+            choice = ui.messageBox('LTC File Generator',
                                    'ffmpeg is needed to add the LTC audio and was not found.\n\n'
                                    'Install it now? The video renders while it downloads.',
                                    buttons=['Install and render', 'Cancel'])
@@ -841,7 +841,7 @@ class LtcGenExt:
                     if os.path.exists(f):
                         os.remove(f)
                 except OSError as exc:
-                    debug(f'LTC File Gen: could not delete {f}: {exc}')
+                    debug(f'LTC File Generator: could not delete {f}: {exc}')
             self.cleanup = []
         j = self.job
         if not j:
@@ -886,7 +886,7 @@ class LtcGenExt:
         if not j.get('auto'):
             raise RuntimeError(f'ffmpeg fast render failed: {err}')
         # Automatic engine: never fail where TouchDesigner would succeed.
-        debug(f'LTC File Gen: ffmpeg fast render failed, using TouchDesigner: {err}')
+        debug(f'LTC File Generator: ffmpeg fast render failed, using TouchDesigner: {err}')
         self._kill_pids(j)
         # The TouchDesigner render reuses the .ltc.pcm and .muxing.mov names,
         # so remove the fast render's files now rather than queue them.
@@ -1257,7 +1257,7 @@ class LtcGenExt:
         py = self.ff.python_for_pip() or ('py' if os.name == 'nt' else 'python3')
         dest = self.ff.pylibs_dir()
         cmd = ' '.join(f'"{a}"' if ' ' in a else a for a in self.ff.install_command(py, dest))
-        lines = [f'LTC File Gen {self.version}', '',
+        lines = [f'LTC File Generator {self.version}', '',
                  'Set Frame Rate, Start, Duration, Codec and Output Folder,',
                  'then click Render. For several files: Add current for each,',
                  'then Render batch. More settings: picture options, LTC audio',
@@ -1287,7 +1287,7 @@ class LtcGenExt:
     def ShowHelp(self):
         text, cmd, ready = self.HelpText()
         buttons = ['Check Again' if ready else 'Install Now', 'Copy Command', 'Close']
-        choice = ui.messageBox('LTC File Gen: Setup & Help', text, buttons=buttons)
+        choice = ui.messageBox('LTC File Generator: Setup & Help', text, buttons=buttons)
         if choice == 0:
             if ready:
                 self.CheckFfmpeg(force=True)

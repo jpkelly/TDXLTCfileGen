@@ -1,8 +1,8 @@
-# LTC File Gen
+# LTC File Generator
 
 Renders timecode movie files in TouchDesigner: LTC audio, a visual readout and a QuickTime timecode track.
 
-![The LTC File Gen panel](images/panel.png)
+![The LTC File Generator panel](images/panel.png)
 
 ## Getting started
 

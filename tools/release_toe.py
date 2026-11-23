@@ -134,7 +134,7 @@ def build(template: Path, tox: Path, out: Path) -> None:
         lines = [l for l in parm.read_text(encoding="utf-8").splitlines()
                  if l.split(" ")[0] not in ("winop", "title", "size", "winw", "winh")]
         end = len(lines) - 1 - lines[::-1].index("?")
-        lines[end:end] = [f"winop 0 /project1/{COMP}", 'title 16 "LTC File Gen" me', "size 0 custom",
+        lines[end:end] = [f"winop 0 /project1/{COMP}", 'title 16 "LTC File Generator" me', "size 0 custom",
                           f"winw 0 {PANEL_SIZE[0]}", f"winh 0 {PANEL_SIZE[1]}"]
         parm.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

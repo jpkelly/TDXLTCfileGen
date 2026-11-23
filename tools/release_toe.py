@@ -33,7 +33,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 TOX = REPO / "td" / "LTCfileGen.tox"
 COMP = "LTCfileGen"
-PANEL_SIZE = (1100, 800)
+PANEL_SIZE = (1100, 836)          # tools/td_build_ui.py PANEL_SIZE
 TEMPLATES = ("/Applications/TouchDesigner.app/Contents/Resources/tfs/Samples/Setup/Base/NewProject.toe",
              r"C:\Program Files\Derivative\TouchDesigner\Samples\Setup\Base\NewProject.toe")
 #: Must not appear anywhere in the shipped files (plus this machine's name).

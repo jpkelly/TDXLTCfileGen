@@ -53,7 +53,7 @@ def test_hap_keeps_rgb_and_is_not_range_converted():
 
 
 def test_alpha_frames_keep_their_alpha_into_yuv():
-    enc = ff.FAST_ENCODERS["prores4444"][1]
+    enc = ff.FAST_ENCODERS["prores4444alpha"][1]
     cmd = ff.encode_command("ffmpeg", enc, 64, 64, "ya8", Fraction(25), PCM, "o.mov")
     assert "-pix_fmt ya8" in " ".join(cmd)
     assert cmd[cmd.index("-pix_fmt", cmd.index("-c:v")) + 1] == "yuva444p10le"
@@ -69,9 +69,14 @@ def test_mux_relabels_prores_as_bt709_in_frames_and_container():
     assert "-bsf:v" not in ff.mux_command("ffmpeg", "v.mov", PCM, "o.mov")
 
 
+def test_opaque_prores_4444_has_no_alpha_plane():
+    assert [e.pix_fmt for e in ff.FAST_ENCODERS["prores4444"]] == ["p410le", "yuv444p10le"]
+    assert [e.pix_fmt for e in ff.FAST_ENCODERS["prores4444alpha"]] == ["ayuv64le", "yuva444p10le"]
+
+
 def test_every_fast_codec_has_an_encoder_listed():
     assert set(ff.FAST_ENCODERS) == {"hap", "hapalpha", "hapq", "prores422hq", "prores422", "prores4444",
-                                     "h264", "h265"}
+                                     "prores4444alpha", "h264", "h265"}
     for encs in ff.FAST_ENCODERS.values():
         assert encs and all(isinstance(e, ff.FastEncoder) for e in encs)
 
@@ -103,7 +108,7 @@ def _decode(path, w=W, h=H, fmt="rgb24"):
 
 
 @needs_ffmpeg
-@pytest.mark.parametrize("codec", ["hap", "prores422hq", "h264"])
+@pytest.mark.parametrize("codec", ["hap", "prores422hq", "prores4444", "h264"])
 def test_worker_makes_a_complete_verified_movie(tmp_path, codec):
     plan, cfg, layers, info, job, path = _job(tmp_path, codec)
     env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -136,7 +141,7 @@ def test_worker_reports_a_failing_encoder(tmp_path):
 
 
 @needs_ffmpeg
-@pytest.mark.parametrize("codec", ["hapalpha", "prores4444"])
+@pytest.mark.parametrize("codec", ["hapalpha", "prores4444alpha"])
 @pytest.mark.parametrize("colour", [False, True])
 def test_worker_makes_movies_with_a_clear_background(tmp_path, codec, colour):
     plan, cfg, layers, info, job, path = _job(tmp_path, codec, colour=colour, alpha=True)

@@ -16,8 +16,8 @@ For several files, click **Add current** for each, then **Render batch**.
 
 - 23.976, 24, 25, 29.97 DF/NDF, 30, 48, 50, 59.94 DF/NDF and 60 fps
 - Start, duration and pre-roll; batches
-- HAP, HAP Q, NotchLC, ProRes 422 / HQ, H.264, H.265; up to 3840x2160 or custom
-- HAP Alpha and ProRes 4444: clear background for overlays (premultiplied alpha)
+- HAP, HAP Q, NotchLC, ProRes 422 / HQ / 4444, H.264, H.265; up to 3840x2160 or custom
+- HAP Alpha, NotchLC Alpha, ProRes 4444 Alpha: **Transparent** gives a clear background for overlays (premultiplied alpha)
 - Movie, movie + WAV, or WAV only (an hour of LTC in about 10 s)
 - Optional second count, countdown, sync flash, frame marker, info caption
 - Adjustable LTC (SMPTE ST 12-1): sample rate, bit depth, channels, level, rise time, user bits

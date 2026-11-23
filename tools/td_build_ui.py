@@ -32,6 +32,7 @@ SIZE_TITLE, SIZE_BUTTON, SIZE_TEXT, SIZE_LABEL = 20, 14, 13, 11
 MARGIN, GUTTER = 16, 16
 ROW_H, ROW_GAP, GROUP_GAP, LABEL_W, FORM_W = 30, 6, 14, 128, 440
 TOP_H = 56
+PANEL_SIZE = (1100, 836)          # the component's panel (and the release window: tools/release_toe.py)
 BG = (0.08, 0.08, 0.09)
 BAR_BG = (0.13, 0.13, 0.15)
 TEXT = (0.92, 0.92, 0.92)
@@ -61,6 +62,7 @@ FORM = [
     ('gap',),
     ('dropDownMenu', 'output', 'OUTPUT', 'Output'),
     ('dropDownMenu', 'codec', 'CODEC', 'Codec'),
+    ('buttonToggle', 'transparent', 'TRANSPARENT', 'Transparent'),
     ('dropDownMenu', 'engine', 'ENGINE', 'Engine'),
     ('dropDownMenu', 'size', 'SIZE', 'Resolution'),
     ('int2', 'customsize', 'WIDTH / HEIGHT', ('Customw', 'Customh')),
@@ -75,8 +77,12 @@ FORM = [
 #: Toggle parameters, so the expressions return True/False.
 DISPLAY = {'customsize': "parent.LtcGen.par.Resolution.eval() == 'custom'"}
 _MOVIE = "parent.LtcGen.par.Output.eval() != 'wav'"           # video settings apply
+#: Codecs with an alpha channel (LtcGenExt.ALPHA_CODECS): Transparent is enabled only for these.
+ALPHA_CODECS = ('hapalpha', 'notchlcalpha', 'prores4444alpha')
+_TRANSPARENT = f"{_MOVIE} and parent.LtcGen.par.Codec.eval() in {ALPHA_CODECS!r}"
 ENABLE = {'dropframe': "parent.LtcGen.par.Rate.eval() in ('29.97', '59.94')",
-          'codec': _MOVIE, 'engine': _MOVIE, 'size': _MOVIE, 'customsize': _MOVIE}
+          'codec': _MOVIE, 'transparent': _TRANSPARENT, 'engine': _MOVIE, 'size': _MOVIE,
+          'customsize': _MOVIE}
 
 #: Settings that need no control: read-only state and the pulses behind the
 #: panel's buttons.
@@ -504,8 +510,10 @@ def _ensure_readonly(comp, name, after):
 
 
 #: Codec menu (Video page). Keys match CODECS in td/LtcGenExt.py.
-CODEC_MENU = [('hap', 'HAP'), ('hapalpha', 'HAP Alpha'), ('hapq', 'HAP Q'), ('notchlc', 'NotchLC'),
-              ('prores422hq', 'ProRes 422 HQ'), ('prores422', 'ProRes 422'), ('prores4444', 'ProRes 4444'),
+CODEC_MENU = [('hap', 'HAP'), ('hapalpha', 'HAP Alpha'), ('hapq', 'HAP Q'),
+              ('notchlc', 'NotchLC'), ('notchlcalpha', 'NotchLC Alpha'),
+              ('prores422hq', 'ProRes 422 HQ'), ('prores422', 'ProRes 422'),
+              ('prores4444', 'ProRes 4444'), ('prores4444alpha', 'ProRes 4444 Alpha'),
               ('h264', 'H.264'), ('h265', 'H.265')]
 
 
@@ -514,6 +522,25 @@ def _ensure_codec_menu(comp):
     par.menuNames = [k for k, _ in CODEC_MENU]
     par.menuLabels = [label for _, label in CODEC_MENU]
     par.default = 'hap'
+
+
+def _ensure_transparent(comp):
+    """Transparent background (Video page, after Codec). Enabled only for the
+    alpha codecs (HAP Alpha, NotchLC Alpha, ProRes 4444 Alpha), on or off as
+    the user sets it; any other codec, or WAV only, also turns it off
+    (LtcGenExt.OnParChange)."""
+    if not hasattr(comp.par, 'Transparent'):
+        page = comp.par.Codec.page
+        par = page.appendToggle('Transparent')[0]
+        par.default = par.val = False
+        names = [p.name for p in page.pars]
+        names.remove('Transparent')
+        names.insert(names.index('Codec') + 1, 'Transparent')
+        page.sort(*names)
+    par = comp.par.Transparent
+    par.label = 'Transparent background'
+    par.help = 'Clear background for overlays. Alpha codecs only; off = solid picture.'
+    par.enableExpr = f"me.par.Output.eval() != 'wav' and me.par.Codec.eval() in {ALPHA_CODECS!r}"
 
 
 #: Preview only: checks behind the picture, so a clear background shows.
@@ -585,7 +612,9 @@ def build_ui(comp_path='/project1/LTCfileGen'):
     _ensure_readonly(comp, 'Outputfile', 'Estimate')    # the file a render writes
     _ensure_readonly(comp, 'Lastfile', 'Outputfile')    # last finished file (Show in Finder)
     _ensure_output_menu(comp)
+    _ensure_transparent(comp)
     _ensure_codec_menu(comp)
+    comp.par.w, comp.par.h = PANEL_SIZE
     body = comp.op('ui_body')
     _build_settings(comp, body)
     form, bound, form_h = _build_form(comp, body)

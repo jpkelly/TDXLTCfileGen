@@ -50,15 +50,19 @@ CODECS = {
     'hapalpha':    ('HAP Alpha',     'hap',     'hap',         'rgba',          4),
     'hapq':        ('HAP Q',         'hap',     'hapq',        'rgb',           4),
     'notchlc':     ('NotchLC',       'notchlc', None,          'rgb',           4),
+    'notchlcalpha': ('NotchLC Alpha', 'notchlc', None,         'rgba',          4),
     'prores422hq': ('ProRes 422 HQ', 'prores',  'prores422hq', 'yuv42210bit',   2),
     'prores422':   ('ProRes 422',    'prores',  'prores422',   'yuv42210bit',   2),
-    'prores4444':  ('ProRes 4444',   'prores',  'prores4444',  'yuva444412bit', 2),
+    'prores4444':  ('ProRes 4444',   'prores',  'prores4444',  'yuv44410bit',   2),
+    'prores4444alpha': ('ProRes 4444 Alpha', 'prores', 'prores4444', 'yuva444412bit', 2),
     'h264':        ('H.264',         'h264',    None,          'yuv420',      2),
     'h265':        ('H.265',         'h265',    None,          'yuv420',      2),
 }
 
-#: Codecs with a clear background (alpha channel), for overlays.
-ALPHA_CODECS = ('hapalpha', 'prores4444')
+#: Codecs whose files carry an alpha channel. Transparent (Video page) is
+#: enabled only for these and the user turns it on or off: on = clear
+#: background (for overlays), off = solid picture with alpha 255.
+ALPHA_CODECS = ('hapalpha', 'notchlcalpha', 'prores4444alpha')
 
 #: Codecs Movie File Out writes only with a Commercial or Pro licence
 #: (TouchDesigner engine only: ffmpeg fast encodes them with any licence).
@@ -74,7 +78,7 @@ EST_LOOP_SHARE = 0.9
 #: Conservative ffmpeg fast-engine speeds at 1920x1080 (frames/s, every
 #: picture option on, M4 Max), scaled by pixel count for other sizes.
 FAST_EST_FPS = {'hap': 500, 'hapalpha': 400, 'hapq': 400, 'prores422hq': 400, 'prores422': 400,
-                'prores4444': 150, 'h264': 400, 'h265': 150}
+                'prores4444': 150, 'prores4444alpha': 150, 'h264': 400, 'h265': 150}
 
 #: WAV only: seconds of LTC written per second (1 h in about 10 s on an M4 Max).
 WAV_SPEED = 300
@@ -309,6 +313,11 @@ class LtcGenExt:
         codec = p.Codec.eval()
         if codec not in CODECS:
             raise ValueError(f'unknown codec {codec!r}')
+        output = p.Output.eval() if hasattr(p, 'Output') else 'movie'
+        # Clear background: Transparent on, an alpha codec and a movie (the
+        # button is greyed out and off otherwise). cfg['alpha'] = clear picture.
+        transparent = bool(p.Transparent.eval()) if hasattr(p, 'Transparent') else False
+        alpha = transparent and codec in ALPHA_CODECS and output != 'wav'
         res = p.Resolution.eval()
         w, h = RESOLUTIONS[res] if res in RESOLUTIONS else (int(p.Customw.eval()), int(p.Customh.eval()))
         mult = CODECS[codec][4]
@@ -331,7 +340,7 @@ class LtcGenExt:
         audio.validate()
 
         cfg = {
-            'w': w, 'h': h, 'codec': codec, 'alpha': codec in ALPHA_CODECS,
+            'w': w, 'h': h, 'codec': codec, 'alpha': alpha,
             'main': p.Mainreadout.eval(), 'secondary': bool(p.Secondary.eval()),
             'countdown': bool(p.Countdown.eval()), 'flash': bool(p.Syncflash.eval()),
             'marker': bool(p.Framemarker.eval()), 'info': bool(p.Infocaption.eval()),
@@ -340,7 +349,7 @@ class LtcGenExt:
             'fg': (float(p.Textcolorr), float(p.Textcolorg), float(p.Textcolorb)),
             'bg': (float(p.Bgcolorr), float(p.Bgcolorg), float(p.Bgcolorb)),
             'tctrack': bool(p.Timecodetrack.eval()),
-            'output': p.Output.eval() if hasattr(p, 'Output') else 'movie',
+            'output': output,
         }
         if cfg['output'] in ('wav', 'moviewav'):
             self.ltc.check_wav_size(plan.total_samples(audio.sample_rate), audio)
@@ -1159,7 +1168,7 @@ class LtcGenExt:
         cmd = self.ff.mux_command(self.ffinfo.path, j['video'], pcm, j['mux_out'],
                                   timecode=plan.embedded_timecode if j['cfg']['tctrack'] else None,
                                   progress_path=j['progress'], retime=retime,
-                                  bt709=j['cfg']['codec'] == 'prores4444')
+                                  bt709=j['cfg']['codec'] in ('prores4444', 'prores4444alpha'))
         j['log_path'] = j['stem'] + '.mux.log'
         j['log'] = open(j['log_path'], 'wb')
         kw = {'creationflags': 0x08000000} if os.name == 'nt' else {}
@@ -1550,4 +1559,10 @@ class LtcGenExt:
             return
         if self.job:
             return                            # settings are fixed while rendering
+        # A codec without alpha, or WAV only, greys out Transparent and turns
+        # it off; picking an alpha codec only enables it (the user sets it).
+        p = self.pars
+        if (par.name in ('Codec', 'Output') and hasattr(p, 'Transparent') and p.Transparent.eval()
+                and (p.Codec.eval() not in ALPHA_CODECS or p.Output.eval() == 'wav')):
+            p.Transparent = False
         self.Refresh(update_status=absTime.frame > getattr(self, '_quiet_until', -1))

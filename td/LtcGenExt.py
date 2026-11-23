@@ -35,7 +35,9 @@ CODECS = {
 RESOLUTIONS = {'3840x2160': (3840, 2160), '2560x1440': (2560, 1440),
                '1920x1080': (1920, 1080), '1280x720': (1280, 720)}
 
-#: Rendering speed measured on macOS (TouchDesigner caps its loop near 60/s).
+#: Conservative render-speed estimate: one frame per TouchDesigner loop, and
+#: the loop follows the display refresh (about 118/s on a 120 Hz MacBook Pro
+#: display, about 60/s on a 60 Hz display).
 EST_FRAMES_PER_SECOND = 60.0
 
 FINALIZE_TIMEOUT = 600          # s to wait for Movie File Out after record=0
@@ -44,9 +46,11 @@ FINALIZE_TIMEOUT = 600          # s to wait for Movie File Out after record=0
 #: runs at a 1001 rate (23.976/29.97/59.94) and the movie FPS is a whole
 #: number (24/30/60), Movie File Out writes the PROJECT's rate instead, e.g.
 #: a 60 fps file at 60000/1001, or at 30000/1001 in a 29.97 project. In a
-#: 60 fps project every rate is written exactly. 60 is also the loop rate TD
-#: reaches here, so renders are no slower. The user's FPS is restored after.
-RENDER_COOK_RATE = 60.0
+#: whole-number project every rate is written exactly. 120 lets the loop run
+#: at a 120 Hz display's refresh: renders measured 117 frames/s at 120 and
+#: 60/s at 60, with every codec frame-exact (tools/av_check.py). The user's
+#: FPS is restored after.
+RENDER_COOK_RATE = 120.0
 RECORD_CHECK_FRAME = 5          # by then Movie File Out must have opened the file
 
 

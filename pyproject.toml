@@ -1,6 +1,6 @@
 [project]
 name = "ltcfilegen"
-version = "0.1.0"
+version = "0.1.1"
 description = "Render movie files with an LTC timecode audio track and a visual timecode readout (TouchDesigner)"
 license = "MIT"
 requires-python = ">=3.11"

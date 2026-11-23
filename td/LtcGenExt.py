@@ -65,6 +65,9 @@ EST_LOOP_SHARE = 0.9
 FAST_EST_FPS = {'hap': 500, 'hapq': 400, 'prores422hq': 400, 'prores422': 400,
                 'h264': 400, 'h265': 150}
 
+#: Where people find the documentation (shown in the help dialog).
+DOCS_URL = 'https://github.com/jpkelly/TDXLTCfileGen'
+
 #: Text TOP of each text line the picture can show (see ltcfilegen.picture).
 LINE_TOPS = {'main': 'text_main', 'sub': 'text_sub', 'count': 'text_count'}
 
@@ -249,6 +252,12 @@ class LtcGenExt:
     @property
     def pars(self):
         return self.ownerComp.par
+
+    @property
+    def version(self):
+        """The engine's version (ltcfilegen.__version__)."""
+        import ltcfilegen
+        return getattr(ltcfilegen, '__version__', '?')
 
     def child(self, name):
         o = self.ownerComp.op(name)
@@ -551,7 +560,7 @@ class LtcGenExt:
             self._set('Ffmpegready', True)
         else:
             why = '; '.join(f'{t.path or t.source}: {t.reason}' for t in tried[:3]) or 'none found'
-            self._set('Ffmpegstatus', f'Not found ({why}). Pulse Install ffmpeg.')
+            self._set('Ffmpegstatus', f'Not found ({why}). Click ? and choose Install Now.')
             self._set('Ffmpegready', False)
         if not self.job and self.plan is not None:
             self.Refresh(update_status=False)     # the estimate depends on the engine
@@ -1248,19 +1257,23 @@ class LtcGenExt:
         py = self.ff.python_for_pip() or ('py' if os.name == 'nt' else 'python3')
         dest = self.ff.pylibs_dir()
         cmd = ' '.join(f'"{a}"' if ' ' in a else a for a in self.ff.install_command(py, dest))
-        lines = ['AUDIO (ffmpeg): ' + ('READY' if info else 'NOT FOUND'), '']
+        lines = [f'LTC File Gen {self.version}', '',
+                 'Set Frame Rate, Start, Duration, Codec and Output Folder,',
+                 'then click Render. For several files: Add current for each,',
+                 'then Render batch. More settings: picture options, LTC audio',
+                 'and the ffmpeg source. Docs: ' + DOCS_URL, '',
+                 'FFMPEG: ' + ('READY' if info else 'NOT FOUND'),
+                 'It adds the LTC audio and runs the fast engine.']
         if info:
             lines += [f'ffmpeg {info.version}', f'  {info.path}', f'  found as: {info.source}',
                       f'ffprobe: {self.ffprobe or "not found (optional)"}']
         else:
-            lines += ['LTC audio is added to the rendered video with ffmpeg,',
-                      'which is not bundled. Install Now downloads it',
-                      '(imageio-ffmpeg, about 30 MB) into a folder in your',
-                      'user Library: no admin rights, nothing written into',
-                      'TouchDesigner, and it survives TouchDesigner updates.',
+            lines += ['', 'Install Now downloads it (imageio-ffmpeg, about 50 MB)',
+                      'into your user data folder: no admin rights, nothing',
+                      'written into TouchDesigner, and it survives updates.',
                       '', 'Also found automatically: Homebrew / MacPorts /',
-                      'winget / Chocolatey / Scoop installs, and copies',
-                      'downloaded by vCon (Setup page: ffmpeg Source).']
+                      'winget / Chocolatey / Scoop installs, and the copy',
+                      'downloaded by vCon (More settings > Setup > ffmpeg Source).']
         lines += ['', 'Install folder:', f'  {dest}', '',
                   'Manual install (Terminal, or cmd / PowerShell):', f'  {cmd}']
         return '\n'.join(lines), cmd, info is not None

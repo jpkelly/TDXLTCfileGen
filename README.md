@@ -2,6 +2,8 @@
 
 A TouchDesigner component that renders timecode movie files for media servers. Each file has an LTC audio track, a visual timecode readout and a QuickTime timecode track.
 
+![The LTC File Gen panel](images/panel.png)
+
 ## Features
 
 - **Rates:** 23.976, 24, 25, 29.97 (DF or NDF), 30, 48, 50, 59.94 (DF or NDF) and 60 fps. Above 30 fps the LTC runs at half rate in frame pairs.
@@ -13,19 +15,20 @@ A TouchDesigner component that renders timecode movie files for media servers. E
 - **LTC audio:** SMPTE ST 12-1. Defaults are 48 kHz, 24-bit, both channels and −12 dBFS. Rate, depth, channels, level, rise time and user bits are adjustable.
 - **Checked:** every file is read back and checked for frame count, rate, audio length and start timecode.
 
-## Requirements
-
-- **TouchDesigner 2025.33230 or later.** Tested on macOS only. The Non-Commercial licence limits output to 1280x1280. H.264/H.265 export needs a Commercial or Pro licence.
-- **ffmpeg**, which adds the LTC audio. Click **?** in the panel and choose **Install Now**, or use an existing ffmpeg (Homebrew, MacPorts, winget, Chocolatey, Scoop or a custom path). The **?** button is blue when ffmpeg is ready and pulses red when it is missing.
-
 ## Getting started
 
-Download from [Releases](https://github.com/jpkelly/TDXLTCfileGen/releases):
+1. Download **`LTCfileGen-<version>.toe`** from [Releases](https://github.com/jpkelly/TDXLTCfileGen/releases) and open it. TouchDesigner shows the panel in its own window (Perform mode; Esc shows the network, F1 returns).
+2. The first time, click **?** and choose **Install Now** to download ffmpeg (about 50 MB, into your user data folder; no admin rights needed). The **?** button pulses red until ffmpeg is ready, then turns teal.
+3. Set the frame rate, start, duration, codec and output folder, then click **Render**. The line under the preview shows the file it will write.
 
-- **`LTCfileGen-<version>.toe`:** open it, and TouchDesigner shows the panel in its own window (Perform mode). Press Esc for the network, F1 to return.
-- **`LTCfileGen-<version>.tox`:** drag it into a network of your own project, then right-click it and choose **View** to open the panel.
+For several files, set up each one and click **Add current**, then **Render batch**. **More settings…** has the picture options (readouts, countdown, colours), the LTC audio settings and the ffmpeg source.
 
-Set the rate, start, duration, codec and output folder, then click **Render**. The line under the preview shows the file it will write. For a batch, set up each file and click **Add current**, then **Render batch**. **More settings…** opens the picture options (readouts, countdown, colours), the LTC audio settings and the ffmpeg setup.
+## Requirements
+
+- **TouchDesigner 2025.33230 or later.** Tested on macOS only.
+- **ffmpeg:** **Install Now** (above), or an existing install from Homebrew, MacPorts, winget, Chocolatey, Scoop or a custom path (**More settings… → Setup**). The ffmpeg that Homebrew installs has no HAP encoder: HAP then renders through TouchDesigner, which is slower.
+- **Licence limits:** TouchDesigner Non-Commercial renders up to 1280x1280. TouchDesigner's own H.264/H.265 export needs a Commercial or Pro licence; the ffmpeg fast engine encodes them itself (not tested on a Non-Commercial licence).
+- **Disk space:** an hour of 1080p 59.94 fps HAP is about 13 GB. While a file renders, its LTC audio also takes about 1 GB per hour beside it.
 
 The component carries its own code. On first use it writes it to a versioned folder in the user data folder (`~/Library/Application Support/LTCfileGen/engine` on macOS, `%LOCALAPPDATA%\LTCfileGen\engine` on Windows).
 
@@ -40,7 +43,11 @@ The **Engine** menu picks how files are made:
 
 **Auto** (the default) uses ffmpeg fast when it can. Before every fast render, it checks that its frames match TouchDesigner's. NotchLC always uses TouchDesigner, because ffmpeg has no NotchLC encoder. If the fast engine fails, Auto renders in TouchDesigner instead.
 
-The TouchDesigner engine runs as fast as the display refreshes, for example about 120 frames/s on a 120 Hz screen. While it renders, the project runs at the fastest display's refresh rate, then returns to its own FPS. Anything else animating in the same project runs at that rate meanwhile, so render show content from the standalone `.toe`.
+The TouchDesigner engine runs as fast as the display refreshes, for example about 120 frames/s on a 120 Hz screen. While it renders, the project runs at the fastest display's refresh rate, then returns to its own FPS.
+
+## In your own TouchDesigner project
+
+TouchDesigner users can also drop the component, [`td/LTCfileGen.tox`](td/LTCfileGen.tox) in this repository, into a project of their own; right-click it and choose **View** for the panel. Renders through the TouchDesigner engine (NotchLC, or a fallback) change the whole project's FPS while they run, so anything else animating in that project runs at the wrong speed meanwhile.
 
 ## Development
 
@@ -79,11 +86,11 @@ Edits to `td/` and `src/ltcfilegen/` then take effect in TouchDesigner. The pane
 ### Releasing
 
 1. In the development project, run `release_tox()` (from `tools/td_release.py`, like `link_to_repo()` above). It writes `td/LTCfileGen.tox` with the code baked in and every setting at its default.
-2. Run `python3 tools/release_toe.py`. It puts the component in TouchDesigner's own empty project and writes `dist/LTCfileGen-<version>.toe`, which opens straight to the panel, plus a copy of the `.tox`.
+2. Run `python3 tools/release_toe.py`. It puts the component in TouchDesigner's own empty project and writes `dist/LTCfileGen-<version>.toe`, which opens straight to the panel. Attach only that file to the GitHub release.
 
 ## Status
 
-Early release. Tested on macOS with TouchDesigner 2025.33230. Windows is untested.
+Early release. Tested on macOS with TouchDesigner 2025.33230. Windows is untested: if **Install Now** cannot find a Python to download ffmpeg with, install ffmpeg with `winget install ffmpeg`, then click **?** and **Check Again**. Problems and suggestions: [Issues](https://github.com/jpkelly/TDXLTCfileGen/issues).
 
 ## Licence
 

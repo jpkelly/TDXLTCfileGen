@@ -14,7 +14,9 @@ ships (start-file bookmarks, MIDI devices, stored data), and:
 * stamps the project with the component's TouchDesigner build;
 * opens in Perform mode, showing the component's panel in its own window.
 
-It checks the result by expanding it again, then copies the .tox beside it.
+It checks the result by expanding it again. The release ships only this
+.toe; TouchDesigner users who want the component take td/LTCfileGen.tox
+from the repository.
 """
 
 from __future__ import annotations
@@ -176,9 +178,7 @@ def main() -> int:
     out = args.out or REPO / "dist" / f"LTCfileGen-{version()}.toe"
     print(f"=== building {out.name} from {args.tox.name} ===")
     build(template, args.tox, out)
-    tox_out = out.with_suffix(".tox")
-    shutil.copyfile(args.tox, tox_out)
-    print(f"wrote {out}\nwrote {tox_out}")
+    print(f"wrote {out}")
     return 0
 
 

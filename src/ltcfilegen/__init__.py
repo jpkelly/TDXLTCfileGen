@@ -3,4 +3,4 @@
 Pure Python (numpy for audio); no TouchDesigner imports.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
